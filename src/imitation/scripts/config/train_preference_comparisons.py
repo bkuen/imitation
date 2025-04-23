@@ -56,6 +56,10 @@ def train_defaults():
     gatherer_kwargs = {}
     active_selection = False
     active_selection_oversampling = 2
+    variquery_enabled = False
+    vae_latent_dim = 16
+    vae_hidden_dims = [128, 64, 32]
+    vae_epochs = 10
     uncertainty_on = "logit"
     fragmenter_kwargs = {
         "warning_threshold": 0,

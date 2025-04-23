@@ -23,6 +23,7 @@ from imitation.scripts.ingredients import environment
 from imitation.scripts.ingredients import logging as logging_ingredient
 from imitation.scripts.ingredients import policy_evaluation, reward
 from imitation.scripts.ingredients import rl as rl_common
+import imitation.algorithms.variquery.variquery as variquery
 
 
 def save_model(
@@ -79,6 +80,10 @@ def train_preference_comparisons(
     gatherer_kwargs: Mapping[str, Any],
     active_selection: bool,
     active_selection_oversampling: int,
+    variquery_enabled: bool,
+    vae_epochs: int,
+    vae_latent_dim: int,
+    vae_hidden_dims: list[int],
     uncertainty_on: str,
     fragmenter_kwargs: Mapping[str, Any],
     allow_variable_horizon: bool,
@@ -230,6 +235,18 @@ def train_preference_comparisons(
                 base_fragmenter=fragmenter,
                 fragment_sample_factor=active_selection_oversampling,
                 uncertainty_on=uncertainty_on,
+                custom_logger=custom_logger,
+            )
+        if variquery_enabled:
+            # Create VARIQuery fragmenter
+            fragmenter = variquery.VARIQueryFragmenter(
+                state_dim=venv.observation_space.shape[0],
+                allow_variable_horizon=allow_variable_horizon,
+                sequence_length=fragment_length,
+                vae_epochs=vae_epochs,
+                vae_latent_dim=vae_latent_dim,
+                preference_model=preference_model,
+                vae_hidden_dims=vae_hidden_dims,
                 custom_logger=custom_logger,
             )
         gatherer = gatherer_cls(
