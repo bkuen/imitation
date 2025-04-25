@@ -208,6 +208,7 @@ setup(
         "tensorboard>=1.14",
         "huggingface_sb3~=3.0",
         "optuna>=3.0.1",
+        "umap-learn>=0.5.1",
         "datasets>=2.8.0",
     ],
     tests_require=TESTS_REQUIRE,

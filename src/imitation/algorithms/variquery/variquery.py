@@ -101,7 +101,13 @@ class ClusterVisualizer:
         # Normalize vectors
         norms = np.linalg.norm(latent_vectors, axis=1, keepdims=True)
         normalized_vectors = latent_vectors / (norms + 1e-8)
-        
+
+        # from sklearn.decomposition import PCA
+        #
+        # … right before your TSNE call …
+        # pca = PCA(n_components=min(20, normalized_vectors.shape[1]), random_state=42)
+        # vectors_for_tsne = pca.fit_transform(normalized_vectors)
+
         # Adjust t-SNE parameters based on dataset size
         perplexity = min(30, max(5, n_samples // 5))  # Scale perplexity with dataset size
         
@@ -110,26 +116,35 @@ class ClusterVisualizer:
                 self.logger.log(f"Warning: Too few samples ({n_samples}) for meaningful t-SNE visualization")
             return
             
-        # Create t-SNE with adjusted parameters
-        tsne = TSNE(
-            n_components=2,
-            random_state=42,
-            perplexity=perplexity,
-            n_iter=1000,  # Increase iterations for better convergence
-            init='pca',   # Use PCA initialization for better global structure
-            learning_rate='auto',
-            early_exaggeration=12.0  # Increase for better cluster separation
+        # # Create t-SNE with adjusted parameters
+        # tsne = TSNE(
+        #     n_components=2,
+        #     random_state=42,
+        #     perplexity=perplexity,
+        #     n_iter=5000,  # Increase iterations for better convergence
+        #     init='pca',   # Use PCA initialization for better global structure
+        #     learning_rate='auto',
+        #     early_exaggeration=12.0,  # Increase for better cluster separation
+        #     metric='cosine',
+        # )
+
+        import umap
+        umap_mapper = umap.UMAP(
+            n_neighbors=15,
+            min_dist=0.1,
+            metric='cosine',
+            random_state=42
         )
         
         try:
-            embedded = tsne.fit_transform(normalized_vectors)
+            embedded = umap_mapper.fit_transform(normalized_vectors)
             
             # Normalize the embedding to improve visualization
             embedded = (embedded - embedded.min(axis=0)) / (embedded.max(axis=0) - embedded.min(axis=0))
             
         except Exception as e:
             if self.logger:
-                self.logger.log(f"t-SNE visualization failed: {str(e)}")
+                self.logger.log(f"UMAP visualization failed: {str(e)}")
             return
         
         # Create plot with improved styling
@@ -176,9 +191,9 @@ class ClusterVisualizer:
                     xyB=(embedded[idx2, 0], embedded[idx2, 1]),
                     coordsA="data", coordsB="data",
                     axesA=plt.gca(), axesB=plt.gca(),
-                    arrowstyle="->",
+                    arrowstyle="-",
                     connectionstyle="arc3,rad=0.2",
-                    color='red',
+                    edgecolor='red',
                     alpha=0.5,
                     linewidth=1.5
                 )
@@ -190,7 +205,7 @@ class ClusterVisualizer:
                     [embedded[idx1, 1], embedded[idx2, 1]],
                     c='red',
                     s=150,
-                    alpha=0.8,
+                    alpha=0.05,
                     zorder=5,
                     edgecolors='white',
                     linewidth=0.5
@@ -203,8 +218,8 @@ class ClusterVisualizer:
         # Improve title and labels
         plt.title(f"{title}\n(n_samples={n_samples}, perplexity={perplexity})", 
                  pad=20, fontsize=12, fontweight='bold')
-        plt.xlabel('t-SNE Component 1', fontsize=10)
-        plt.ylabel('t-SNE Component 2', fontsize=10)
+        plt.xlabel('Component 1', fontsize=10)
+        plt.ylabel('Component 2', fontsize=10)
         
         # Improve legend
         legend = plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left', 
