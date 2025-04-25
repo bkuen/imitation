@@ -1,6 +1,9 @@
 import torch
 from sklearn.cluster import KMeans
-from imitation.algorithms.preference_comparisons import Fragmenter, PreferenceModel
+from sklearn.manifold import TSNE
+import matplotlib.pyplot as plt
+import os
+from imitation.algorithms.preference_comparisons import Fragmenter, PreferenceModel, RandomFragmenter
 from imitation.data import rollout
 from imitation.regularization import regularizers
 from imitation.rewards import reward_nets
@@ -17,6 +20,7 @@ from typing import (
     Sequence,
     Tuple,
     Optional,
+    Dict,
 )
 
 import numpy as np
@@ -24,45 +28,20 @@ import torch as th
 import torch.nn.functional as F
 
 class StateSegmentDataset(data_th.Dataset):
-    """Dataset for the VARIQuery algorithm"""
+    """Dataset for the VARIQuery algorithm that handles pre-made fragments"""
 
     def __init__(
         self,
-        trajectories: Sequence[TrajectoryWithRew],
+        fragments: Sequence[TrajectoryWithRew],
         fragment_length: int,
     ):
-        # Store fragments as TrajectoryWithRew objects
-        self.fragments: List[TrajectoryWithRew] = []
+        # Store fragments directly
+        self.fragments = list(fragments)
         self.fragment_length = fragment_length
-        
-        # Create fixed-length fragments from each trajectory
-        for traj in trajectories:
-            # Number of possible fragments in this trajectory
-            # Subtract 1 to ensure we have fragment_length actions and fragment_length + 1 observations
-            num_fragments = len(traj) - fragment_length
-            
-            for start_idx in range(num_fragments):
-                # For observations, include one more timestep
-                obs_end_idx = start_idx + fragment_length + 1
-                # For actions and rewards, use one less timestep
-                act_end_idx = start_idx + fragment_length
-                
-                # Create a new TrajectoryWithRew for this fragment
-                fragment = TrajectoryWithRew(
-                    obs=traj.obs[start_idx:obs_end_idx],  # fragment_length + 1 observations
-                    acts=traj.acts[start_idx:act_end_idx] if traj.acts is not None else None,  # fragment_length actions
-                    infos=traj.infos[start_idx:act_end_idx] if traj.infos is not None else None,  # fragment_length infos
-                    terminal=False,  # Since this is a fragment, it's not terminal
-                    rews=traj.rews[start_idx:act_end_idx] if traj.rews is not None else None,  # fragment_length rewards
-                )
-                self.fragments.append(fragment)
 
         # Add this check
         if len(self.fragments) == 0:
-            raise ValueError(
-                f"No fragments were created. Check that trajectories are longer than "
-                f"fragment_length ({fragment_length}) and that trajectories is not empty."
-            )
+            raise ValueError("No fragments provided. The fragment sequence is empty.")
 
     def __len__(self):
         return len(self.fragments)
@@ -85,6 +64,173 @@ class StateSegmentDataset(data_th.Dataset):
         fragment = self.fragments[idx]
         return th.from_numpy(fragment.obs[:self.fragment_length]).float()
 
+class ClusterVisualizer:
+    """Visualizer for clusters and selected pairs in the latent space."""
+
+    def __init__(self, logger: Optional[imit_logger.HierarchicalLogger] = None):
+        """Initialize the cluster visualizer.
+        
+        Args:
+            logger: Optional logger for tracking visualization progress
+        """
+        self.logger = logger
+
+    def visualize_clusters_and_pairs(
+        self,
+        encoded_segments: th.Tensor,
+        clusters: List[List[int]],
+        selected_pairs: List[TrajectoryWithRewPair],
+        fragments_to_indices: Dict,
+        save_path: str,
+        title: str = 'Latent Space Clusters and Selected Pairs'
+    ):
+        """Visualize clusters and selected pairs in 2D using t-SNE.
+        
+        Args:
+            encoded_segments: Encoded segments in latent space
+            clusters: List of lists containing indices for each cluster
+            selected_pairs: List of selected trajectory pairs
+            fragments_to_indices: Mapping from fragment ID to index
+            save_path: Path to save the plot
+            title: Title for the plot
+        """
+        # Convert to numpy for t-SNE
+        latent_vectors = encoded_segments.cpu().numpy()
+        n_samples = latent_vectors.shape[0]
+        
+        # Normalize vectors
+        norms = np.linalg.norm(latent_vectors, axis=1, keepdims=True)
+        normalized_vectors = latent_vectors / (norms + 1e-8)
+        
+        # Adjust t-SNE parameters based on dataset size
+        perplexity = min(30, max(5, n_samples // 5))  # Scale perplexity with dataset size
+        
+        if n_samples < 4:
+            if self.logger:
+                self.logger.log(f"Warning: Too few samples ({n_samples}) for meaningful t-SNE visualization")
+            return
+            
+        # Create t-SNE with adjusted parameters
+        tsne = TSNE(
+            n_components=2,
+            random_state=42,
+            perplexity=perplexity,
+            n_iter=1000,  # Increase iterations for better convergence
+            init='pca',   # Use PCA initialization for better global structure
+            learning_rate='auto',
+            early_exaggeration=12.0  # Increase for better cluster separation
+        )
+        
+        try:
+            embedded = tsne.fit_transform(normalized_vectors)
+            
+            # Normalize the embedding to improve visualization
+            embedded = (embedded - embedded.min(axis=0)) / (embedded.max(axis=0) - embedded.min(axis=0))
+            
+        except Exception as e:
+            if self.logger:
+                self.logger.log(f"t-SNE visualization failed: {str(e)}")
+            return
+        
+        # Create plot with improved styling
+        plt.style.use('default')  # Reset to default style
+        plt.figure(figsize=(12, 8))
+        
+        # Set background color and grid
+        plt.gca().set_facecolor('#f0f0f0')
+        plt.grid(True, linestyle='--', alpha=0.7)
+        
+        # Plot each cluster with different colors and improved visibility
+        colors = ['#1f77b4', '#2ca02c', '#ff7f0e', '#d62728', '#9467bd', 
+                 '#8c564b', '#e377c2', '#7f7f7f', '#bcbd22', '#17becf']  # Better color palette
+        
+        # First plot all points with lower alpha for context
+        plt.scatter(embedded[:, 0], embedded[:, 1], c='gray', alpha=0.1, s=50)
+        
+        # Then plot clusters
+        for cluster_idx, cluster in enumerate(clusters):
+            if not cluster:  # Skip empty clusters
+                continue
+            cluster_points = embedded[cluster]
+            plt.scatter(
+                cluster_points[:, 0],
+                cluster_points[:, 1],
+                alpha=0.6,
+                c=[colors[cluster_idx % len(colors)]],
+                label=f'Cluster {cluster_idx} (n={len(cluster)})',
+                s=100,  # Larger point size
+                edgecolors='white',  # White edges for better visibility
+                linewidth=0.5
+            )
+        
+        # Draw lines between selected pairs with curved arrows
+        for pair in selected_pairs:
+            try:
+                idx1 = fragments_to_indices[id(pair[0])]
+                idx2 = fragments_to_indices[id(pair[1])]
+                
+                # Create curved arrow between pairs
+                from matplotlib.patches import ConnectionPatch
+                con = ConnectionPatch(
+                    xyA=(embedded[idx1, 0], embedded[idx1, 1]),
+                    xyB=(embedded[idx2, 0], embedded[idx2, 1]),
+                    coordsA="data", coordsB="data",
+                    axesA=plt.gca(), axesB=plt.gca(),
+                    arrowstyle="->",
+                    connectionstyle="arc3,rad=0.2",
+                    color='red',
+                    alpha=0.5,
+                    linewidth=1.5
+                )
+                plt.gca().add_patch(con)
+                
+                # Highlight selected points
+                plt.scatter(
+                    [embedded[idx1, 0], embedded[idx2, 0]],
+                    [embedded[idx1, 1], embedded[idx2, 1]],
+                    c='red',
+                    s=150,
+                    alpha=0.8,
+                    zorder=5,
+                    edgecolors='white',
+                    linewidth=0.5
+                )
+            except (KeyError, IndexError) as e:
+                if self.logger:
+                    self.logger.log(f"Warning: Could not plot pair due to missing index: {str(e)}")
+                continue
+        
+        # Improve title and labels
+        plt.title(f"{title}\n(n_samples={n_samples}, perplexity={perplexity})", 
+                 pad=20, fontsize=12, fontweight='bold')
+        plt.xlabel('t-SNE Component 1', fontsize=10)
+        plt.ylabel('t-SNE Component 2', fontsize=10)
+        
+        # Improve legend
+        legend = plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left', 
+                          borderaxespad=0., frameon=True, fancybox=True, shadow=True)
+        legend.get_frame().set_facecolor('white')
+        legend.get_frame().set_alpha(0.8)
+        
+        # Set figure background color
+        plt.gcf().patch.set_facecolor('white')
+        
+        # Add a border around the plot
+        plt.gca().spines['top'].set_visible(True)
+        plt.gca().spines['right'].set_visible(True)
+        plt.gca().spines['bottom'].set_visible(True)
+        plt.gca().spines['left'].set_visible(True)
+        
+        plt.tight_layout()  # Adjust layout to prevent label clipping
+        
+        # Ensure directory exists
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        plt.savefig(save_path, dpi=300, bbox_inches='tight', facecolor='white')  # Higher DPI for better quality
+        plt.close()
+
+        if self.logger:
+            self.logger.log(f"Saved cluster visualization to {save_path}")
+
 class VARIQueryFragmenter(Fragmenter):
     """
     Fragmenter for the VARIQuery algorithm. This fragmenter is used to sample trajectories
@@ -97,29 +243,46 @@ class VARIQueryFragmenter(Fragmenter):
         sequence_length: int,
         vae_latent_dim: int,
         preference_model: PreferenceModel,
-        vae_hidden_dims: List[int] = [128, 64, 32],
+        rng: np.random.Generator,
+        base_fragmenter: Optional[Fragmenter] = None,
         custom_logger: Optional[imit_logger.HierarchicalLogger] = None,
         warning_threshold: int = 10,
         allow_variable_horizon: bool = False,
+        variquery_num_clusters: int = 3,
         # VAE training parameters
+        vae_hidden_dims: List[int] = [128, 64, 32],
         vae_epochs: int = 10,
         vae_batch_size: int = 32,
         vae_lr: float = 1e-3,
         vae_kl_weight: float = 1.0,
-        vae_early_stopping_patience: Optional[int] = 10,
+        vae_early_stopping_patience: Optional[int] = None,
+        fragment_sample_factor: float = 2.0,
         device: str = "cuda" if th.cuda.is_available() else "cpu",
+        visualization_interval: int = 10,
     ):
-        super().__init__(custom_logger=custom_logger)
-        self.warning_threshold = warning_threshold
+        super().__init__(custom_logger)
         self.allow_variable_horizon = allow_variable_horizon
         self.preference_model = preference_model
+        self.fragment_sample_factor = fragment_sample_factor
+        self.visualization_interval = visualization_interval
+        self.visualizer = ClusterVisualizer(custom_logger)
         
+        # Use provided base_fragmenter or create default RandomFragmenter
+        self.base_fragmenter = base_fragmenter or RandomFragmenter(
+            rng=rng,
+            warning_threshold=warning_threshold,
+            custom_logger=custom_logger
+        )
+
+        # Store VARIQuery parameters
+        self.variquery_num_clusters = variquery_num_clusters
+        self.current_iteration = 0
+
         # Store VAE training parameters
         self.vae_epochs = vae_epochs
         self.vae_batch_size = vae_batch_size
         self.vae_lr = vae_lr
         self.vae_kl_weight = vae_kl_weight
-        self.vae_batch_size = vae_batch_size
         self.vae_early_stopping_patience = vae_early_stopping_patience
         self.device = device
         
@@ -137,69 +300,66 @@ class VARIQueryFragmenter(Fragmenter):
         fragment_length: int,
         num_pairs: int,
     ) -> Sequence[TrajectoryWithRewPair]:
-        """The VARIQuery algorithm implementation"""
-        # Check for variable horizon if not allowed
-        if not self.allow_variable_horizon:
-            trajectory_lengths = {len(traj) for traj in trajectories}
-            if len(trajectory_lengths) > 1:
-                raise ValueError(
-                    f"Episodes of different length detected: {trajectory_lengths}. "
-                    "Variable horizon environments are discouraged -- termination "
-                    "conditions leak information about reward. See "
-                    "https://imitation.readthedocs.io/en/latest/getting-started/"
-                    "variable-horizon.html for more information. If you are SURE "
-                    "you want to run imitation on a variable horizon task, then "
-                    "please pass in the flag: `allow_variable_horizon=True`."
-                )
-
-        # Filter out trajectories that are too short
-        trajectories = [traj for traj in trajectories if len(traj) >= fragment_length]
+        # Step 1: Sample more fragments than needed using base_fragmenter (RandomFragmenter)
+        fragments_to_sample = int(self.fragment_sample_factor * num_pairs)
+        initial_fragments = self.base_fragmenter(
+            trajectories=trajectories,
+            fragment_length=fragment_length,
+            num_pairs=fragments_to_sample
+        )
         
-        if not trajectories:
-            raise ValueError(
-                f"No trajectories are long enough to create fragments of length "
-                f"{fragment_length}. All trajectories must be at least {fragment_length} "
-                "steps long."
-            )
-
-        if self.warning_threshold > 0:
-            num_transitions = sum(len(traj) - fragment_length + 1 for traj in trajectories)
-            if num_transitions < self.warning_threshold:
-                self.logger.warn(
-                    f"Fewer transitions ({num_transitions}) than the warning threshold "
-                    f"of {self.warning_threshold} in the fragmenter. This may lead to "
-                    "too little variance in the sampled fragments."
-                )
-
-        # Step 1: Create the dataset of fixed-length state segments
-        self.logger.info("creating dataset of fixed-length state segments")
-        D_un = StateSegmentDataset(trajectories, fragment_length)
-
-        # Step 2: Train the VAE on the dataset and encode the segments
-        self.logger.info("training VAE on dataset")
+        # Convert to dataset for VAE training
+        # Extract all fragments from the pairs into a single list
+        all_fragments = []
+        for f1, f2 in initial_fragments:
+            all_fragments.append(f1)
+            all_fragments.append(f2)
+            
+        D_un = StateSegmentDataset(all_fragments, fragment_length)
+        
+        # Create mapping from fragment to index for visualization
+        self.fragments_to_indices = {
+            id(fragment): idx 
+            for idx, fragment in enumerate(D_un.fragments)
+        }
+        
+        # Step 2: Train VAE and encode segments
         self._train_vae(D_un)
-        self.logger.info("encoding segments")
         D_z = self._encode_segments(D_un)
-
-        self.logger.info("encoded segments shape: {}".format(D_z.shape))
-
-        # Step 3: Cluster the latent space using k-NN
-        self.logger.info("clustering latent space")
-        clusters = self._cluster_latent_space(D_z, num_clusters=10)
-        self.logger.info("clusters: {}".format(clusters))
+        
+        # Step 3: Cluster and sample final pairs
+        clusters = self._cluster_latent_space(D_z, num_clusters=self.variquery_num_clusters)
 
         # Step 4: Sample and rank pairs
-        self.logger.info("sampling random pairs from clusters")
-        self.D_q = self._sample_random_pairs(clusters, D_un, num_pairs)
+        pairs = self._sample_random_pairs(clusters, D_un, num_pairs)
+        ranked_pairs = self._rank_by_ensemble_variance(pairs)
 
-        self.logger.info("D_q type: {}".format(type(self.D_q)))
-        self.logger.info("D_q inner type: {}".format(type(self.D_q[0])))
+        # Always create visualization directory
+        output_dir = self.logger.get_dir()
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # Visualize if it's time to do so or if it's the first iteration
+        should_visualize = self.current_iteration == 0 or self.current_iteration % self.visualization_interval == 0
+        
+        if should_visualize:
+            self.logger.log(f"Creating visualization for iteration {self.current_iteration}")
+            viz_path = os.path.join(
+                output_dir, 
+                f"clusters_iteration_{self.current_iteration:04d}.png"
+            )
+            self.visualizer.visualize_clusters_and_pairs(
+                D_z,
+                clusters,
+                ranked_pairs[:num_pairs],
+                self.fragments_to_indices,
+                save_path=viz_path,
+                title=f'Clusters and Selected Pairs (Iteration {self.current_iteration})'
+            )
 
-        self.logger.info("ranking pairs by ensemble variance")
-        ranked_pairs = self._rank_by_ensemble_variance(self.D_q)
-
+        # Increment the number of iterations
+        self.current_iteration += 1
+        
         # Step 5: Return top N pairs
-        self.logger.info("returning top {} pairs".format(num_pairs))
         return ranked_pairs[:num_pairs]
         
 
@@ -230,13 +390,38 @@ class VARIQueryFragmenter(Fragmenter):
             num_clusters: The number of clusters to use
 
         Returns:
+            List of lists containing indices for each cluster
         """
-        kmeans = KMeans(n_clusters=num_clusters, random_state=0)
-        cluster_labels = kmeans.fit_predict(encoded_segments.cpu().numpy())
-       # Group indices by cluster
+        # Convert to numpy and normalize
+        latent_vectors = encoded_segments.cpu().numpy()
+        
+        # Normalize the vectors to unit length
+        norms = np.linalg.norm(latent_vectors, axis=1, keepdims=True)
+        normalized_vectors = latent_vectors / (norms + 1e-8)  # Add small epsilon to avoid division by zero
+        
+        # Fit k-means with multiple initializations
+        kmeans = KMeans(
+            n_clusters=num_clusters,
+            random_state=42,
+            n_init=10,  # Try multiple initializations
+            max_iter=300  # Increase max iterations
+        )
+        cluster_labels = kmeans.fit_predict(normalized_vectors)
+        
+        # Calculate silhouette score to evaluate clustering quality
+        from sklearn.metrics import silhouette_score
+        if len(normalized_vectors) > 1:
+            score = silhouette_score(normalized_vectors, cluster_labels)
+            self.logger.log(f"Clustering silhouette score: {score:.3f}")
+        
+        # Group indices by cluster
         clusters = [[] for _ in range(num_clusters)]
         for idx, label in enumerate(cluster_labels):
             clusters[label].append(idx)
+            
+        # Log cluster sizes
+        for i, cluster in enumerate(clusters):
+            self.logger.log(f"Cluster {i} size: {len(cluster)}")
             
         return clusters
     

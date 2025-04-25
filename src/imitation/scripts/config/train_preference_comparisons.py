@@ -57,9 +57,15 @@ def train_defaults():
     active_selection = False
     active_selection_oversampling = 2
     variquery_enabled = False
+    variquery_oversampling = 2
+    variquery_num_clusters = 3
     vae_latent_dim = 16
     vae_hidden_dims = [128, 64, 32]
+    vae_lr = 1e-3,
+    vae_kl_weight = 1.0,
+    vae_batch_size = 32,
     vae_epochs = 10
+    vae_early_stopping_patience = None,
     uncertainty_on = "logit"
     fragmenter_kwargs = {
         "warning_threshold": 0,
