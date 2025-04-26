@@ -114,7 +114,7 @@ def half_cheetah():
 
 @train_preference_comparisons_ex.named_config
 def seals_half_cheetah():
-    environment = dict(gym_id="seals/HalfCheetah-v0")
+    environment = dict(gym_id="seals/HalfCheetah-v1")
     rl = dict(
         batch_size=512,
         rl_kwargs=dict(
@@ -188,7 +188,7 @@ def seals_swimmer():
 
 @train_preference_comparisons_ex.named_config
 def seals_walker():
-    environment = dict(gym_id="seals/Walker2d-v0")
+    environment = dict(gym_id="seals/Walker2d-v1")
     policy = dict(
         policy_cls="MlpPolicy",
         policy_kwargs=dict(
