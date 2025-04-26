@@ -386,7 +386,7 @@ class VARIQueryFragmenter(Fragmenter):
         self.logger.info("inside __encdoe_segments")
         self.logger.info("fragments, len: {}".format(len(segments.fragments)))
 
-        x = segments.as_tensor()
+        x = segments.as_tensor().to(self.device)
         self.logger.info("stacked segments, shape: {}".format(x.shape))
         _, _, z = self.vae.encode(x)
         return z

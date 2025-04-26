@@ -262,6 +262,7 @@ def train_preference_comparisons(
                 vae_batch_size=vae_batch_size,
                 vae_early_stopping_patience=vae_early_stopping_patience,
                 custom_logger=custom_logger,
+                device=agent_trainer.algorithm.device,
             )
         gatherer = gatherer_cls(
             **gatherer_kwargs,
