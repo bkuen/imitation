@@ -73,7 +73,7 @@ def half_cheetah():
 
 @eval_policy_ex.named_config
 def seals_half_cheetah():
-    environment = dict(gym_id="seals/HalfCheetah-v0")
+    environment = dict(gym_id="seals/HalfCheetah-v1")
 
 
 @eval_policy_ex.named_config
@@ -118,7 +118,7 @@ def seals_swimmer():
 
 @eval_policy_ex.named_config
 def seals_walker():
-    environment = dict(gym_id="seals/Walker2d-v0")
+    environment = dict(gym_id="seals/Walker2d-v1")
 
 
 @eval_policy_ex.named_config

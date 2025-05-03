@@ -24,6 +24,7 @@ from imitation.scripts.ingredients import logging as logging_ingredient
 from imitation.scripts.ingredients import policy_evaluation, reward
 from imitation.scripts.ingredients import rl as rl_common
 import imitation.algorithms.variquery.variquery as variquery
+from imitation.algorithms.duo.duo import PriorityFragmenter, RewardDifferenceDiversityFragmenter
 
 
 def save_model(
@@ -96,6 +97,9 @@ def train_preference_comparisons(
     checkpoint_interval: int,
     query_schedule: Union[str, type_aliases.Schedule],
     _rnd: np.random.Generator,
+    sampling_strategy: str = 'random',
+    diversity_filtering: Optional[str] = None,
+    replay_buffer_size: int = 1000000,
 ) -> Mapping[str, Any]:
     """Train a reward model using preference comparisons.
 
@@ -156,6 +160,7 @@ def train_preference_comparisons(
             apportion fewer queries to later iterations when the policy is assumed
             to be better and more stable.
         _rnd: Random number generator provided by Sacred.
+        sampling_strategy: Which fragment sampling strategy to use. 'random' (default) uses RandomFragmenter, 'priority' uses DUO-style PriorityFragmenter.
 
     Returns:
         Rollout statistics from trained policy.
@@ -224,19 +229,28 @@ def train_preference_comparisons(
                 **trajectory_generator_kwargs,
             )
 
-        fragmenter: preference_comparisons.Fragmenter = (
-            preference_comparisons.RandomFragmenter(
+        if sampling_strategy == 'priority':
+            fragmenter = PriorityFragmenter(
+                base_algorithm=agent,
+                rng=_rnd,
+                fragment_length=fragment_length,
+                custom_logger=custom_logger,
+            )
+        elif sampling_strategy == 'random':
+            fragmenter = preference_comparisons.RandomFragmenter(
                 **fragmenter_kwargs,
                 rng=_rnd,
                 custom_logger=custom_logger,
             )
-        )
+        else:
+            raise ValueError(f"Invalid sampling strategy: {sampling_strategy}, must be 'random' or 'priority'")
+
         preference_model = preference_comparisons.PreferenceModel(
             **preference_model_kwargs,
             model=reward_net,
         )
         if active_selection:
-            fragmenter = preference_comparisons.ActiveSelectionFragmenter(
+            fragmenter = preference_comparisons.UncertaintyFragmenter(
                 preference_model=preference_model,
                 base_fragmenter=fragmenter,
                 fragment_sample_factor=active_selection_oversampling,
@@ -264,6 +278,17 @@ def train_preference_comparisons(
                 custom_logger=custom_logger,
                 device=agent_trainer.algorithm.device,
             )
+
+        if diversity_filtering is not None:
+            if diversity_filtering == "reward_difference":
+                fragmenter = RewardDifferenceDiversityFragmenter(
+                    preference_model=preference_model,
+                    base_fragmenter=fragmenter,
+                    custom_logger=custom_logger,
+                )
+            else:
+                raise ValueError(f"Invalid diversity filtering: {diversity_filtering}")
+
         gatherer = gatherer_cls(
             **gatherer_kwargs,
             rng=_rnd,
@@ -293,6 +318,8 @@ def train_preference_comparisons(
             custom_logger=custom_logger,
             allow_variable_horizon=allow_variable_horizon,
             query_schedule=query_schedule,
+            sampling_strategy=sampling_strategy,
+            replay_buffer_size=replay_buffer_size,
         )
 
         def save_callback(iteration_num):

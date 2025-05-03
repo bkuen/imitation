@@ -77,6 +77,9 @@ def train_defaults():
 
     checkpoint_interval = 0  # Num epochs between saving (<0 disables, =0 final only)
     query_schedule = "hyperbolic"
+    sampling_strategy = 'random',
+    diversity_filtering = None,
+    replay_buffer_size = 1000000
 
 
 @train_preference_comparisons_ex.named_config

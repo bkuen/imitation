@@ -524,7 +524,7 @@ class PreferenceModel(nn.Module):
         model_probability = 1 / (1 + returns_diff.exp())
         probability = self.noise_prob * 0.5 + (1 - self.noise_prob) * model_probability
         if self.ensemble_model is not None:
-            assert probability.shape == (self.model.num_members,)
+            assert probability.shape == (self.ensemble_model.num_members,)
         else:
             assert probability.shape == ()
         return probability
@@ -665,7 +665,7 @@ class RandomFragmenter(Fragmenter):
         return list(zip(iterator, iterator))
 
 
-class ActiveSelectionFragmenter(Fragmenter):
+class UncertaintyFragmenter(Fragmenter):
     """Sample fragments of trajectories based on active selection.
 
     Actively picks the fragment pairs with the highest uncertainty (variance)
@@ -678,9 +678,10 @@ class ActiveSelectionFragmenter(Fragmenter):
         base_fragmenter: Fragmenter,
         fragment_sample_factor: float,
         uncertainty_on: str = "logit",
+        consensual_filter: bool = False,
         custom_logger: Optional[imit_logger.HierarchicalLogger] = None,
     ) -> None:
-        """Initialize the active selection fragmenter.
+        """Initialize the uncertainty-based fragmenter.
 
         Args:
             preference_model: an ensemble model that predicts the
@@ -689,8 +690,9 @@ class ActiveSelectionFragmenter(Fragmenter):
                 fragment pairs from trajectories
             fragment_sample_factor: the factor of the number of
                 fragment pairs to sample from the base_fragmenter
-            uncertainty_on: the variable to calculate the variance on.
-                Can be logit|probability|label.
+            uncertainty_on: the variable to calculate the uncertainty on.
+                Can be logit|probability|label|probs_interval.
+            consensual_filter: if True, filter out consensual queries (all ensemble members agree).
             custom_logger: Where to log to; if None (default), creates a new logger.
 
         Raises:
@@ -705,7 +707,8 @@ class ActiveSelectionFragmenter(Fragmenter):
         self.base_fragmenter = base_fragmenter
         self.fragment_sample_factor = fragment_sample_factor
         self._uncertainty_on = uncertainty_on
-        if not (uncertainty_on in ["logit", "probability", "label"]):
+        self.consensual_filter = consensual_filter or (uncertainty_on == "probs_interval")
+        if not (uncertainty_on in ["logit", "probability", "label", "probs_interval"]):
             self.raise_uncertainty_on_not_supported()
 
     @property
@@ -714,9 +717,13 @@ class ActiveSelectionFragmenter(Fragmenter):
 
     def raise_uncertainty_on_not_supported(self) -> NoReturn:
         raise ValueError(
-            f"""{self.uncertainty_on} not supported.
-            `uncertainty_on` should be from `logit`, `probability`, or `label`""",
+            f"{self.uncertainty_on} not supported.\n"
+            "`uncertainty_on` should be from `logit`, `probability`, `label`, or `probs_interval`",
         )
+
+    def _is_consensual(self, probs_np: np.ndarray) -> bool:
+        """Return True if all ensemble members agree (>0.5 or <0.5)."""
+        return np.all(probs_np > 0.5) or np.all(probs_np < 0.5)
 
     def __call__(
         self,
@@ -732,22 +739,41 @@ class ActiveSelectionFragmenter(Fragmenter):
             fragment_length=fragment_length,
             num_pairs=fragments_to_sample,
         )
-        var_estimates = np.zeros(len(fragment_pairs))
-        for i, fragment in enumerate(fragment_pairs):
+
+        uncertainties = np.zeros(len(fragment_pairs))
+        filtered_pairs = []
+        idx = 0
+        for fragment in fragment_pairs:
             frag1, frag2 = fragment
             trans1 = rollout.flatten_trajectories([frag1])
             trans2 = rollout.flatten_trajectories([frag2])
             with th.no_grad():
                 rews1 = self.preference_model.rewards(trans1)
                 rews2 = self.preference_model.rewards(trans2)
-            var_estimate = self.variance_estimate(rews1, rews2)
-            var_estimates[i] = var_estimate
-        fragment_idxs = np.argsort(var_estimates)[::-1]  # sort in descending order
-        # return fragment pairs that have the highest uncertainty
-        return [fragment_pairs[idx] for idx in fragment_idxs[:num_pairs]]
+                # For consensual filtering, need probs_np
+                if self.consensual_filter:
+                    probs = self.preference_model.probability(rews1, rews2)
+                    probs_np = probs.cpu().numpy()
+                    if self._is_consensual(probs_np):
+                        continue
+                uncertainty = self.uncertainty_estimate(rews1, rews2)
+            uncertainties[idx] = uncertainty
+            idx += 1
+            filtered_pairs.append(fragment)
 
-    def variance_estimate(self, rews1: th.Tensor, rews2: th.Tensor) -> float:
-        """Gets the variance estimate from the rewards of a fragment pair.
+        # Truncate uncertainties to match filtered_pairs length
+        uncertainties = uncertainties[:len(filtered_pairs)]
+
+        if not filtered_pairs:
+            return []
+
+        # Rank by uncertainty (descending) and select top num_pairs
+        sorted_indices = np.argsort(uncertainties)[::-1]
+        selected_pairs = [filtered_pairs[idx] for idx in sorted_indices[:num_pairs]]
+        return selected_pairs
+
+    def uncertainty_estimate(self, rews1: th.Tensor, rews2: th.Tensor) -> float:
+        """Gets the uncertainty estimate from the rewards of a fragment pair.
 
         Args:
             rews1: rewards obtained by all the ensemble models for the first fragment.
@@ -756,26 +782,33 @@ class ActiveSelectionFragmenter(Fragmenter):
                 Shape - (fragment_length, num_ensemble_members)
 
         Returns:
-            the variance estimate based on the `uncertainty_on` flag.
+            the uncertainty estimate based on the `uncertainty_on` flag.
         """
         if self.uncertainty_on == "logit":
             returns1, returns2 = rews1.sum(0), rews2.sum(0)
-            var_estimate = (returns1 - returns2).var().item()
-        else:  # uncertainty_on is probability or label
+            return (returns1 - returns2).var().item()
+        elif self.uncertainty_on == "probability":
             probs = self.preference_model.probability(rews1, rews2)
             probs_np = probs.cpu().numpy()
             assert probs_np.shape == (self.preference_model.model.num_members,)
-            if self.uncertainty_on == "probability":
-                var_estimate = probs_np.var()
-            elif self.uncertainty_on == "label":  # uncertainty_on is label
-                preds = (probs_np > 0.5).astype(np.float32)
-                # probability estimate of Bernoulli random variable
-                prob_estimate = preds.mean()
-                # variance estimate of Bernoulli random variable
-                var_estimate = prob_estimate * (1 - prob_estimate)
-            else:
-                self.raise_uncertainty_on_not_supported()
-        return var_estimate
+            return probs_np.var()
+        elif self.uncertainty_on == "label":
+            probs = self.preference_model.probability(rews1, rews2)
+            probs_np = probs.cpu().numpy()
+            assert probs_np.shape == (self.preference_model.model.num_members,)
+            preds = (probs_np > 0.5).astype(np.float32)
+            # probability estimate of Bernoulli random variable
+            prob_estimate = preds.mean()
+            # variance estimate of Bernoulli random variable
+            return prob_estimate * (1 - prob_estimate)
+        elif self.uncertainty_on == "probs_interval":
+            probs = self.preference_model.probability(rews1, rews2)
+            probs_np = probs.cpu().numpy()
+            if not hasattr(self.preference_model, 'ensemble_model') or self.preference_model.ensemble_model is None:
+                raise ValueError("'probs_interval' uncertainty_on requires an ensemble model.")
+            return np.max(probs_np) - np.min(probs_np)
+        else:
+            self.raise_uncertainty_on_not_supported()
 
 
 class PreferenceGatherer(abc.ABC):
@@ -1478,6 +1511,59 @@ QUERY_SCHEDULES: Dict[str, type_aliases.Schedule] = {
     "inverse_quadratic": lambda t: 1.0 / (1.0 + t**2),
 }
 
+class ReplayBuffer:
+    """A replay buffer that stores trajectories for priority sampling."""
+    
+    def __init__(
+        self,
+        max_size: int,
+        rng: np.random.Generator,
+    ):
+        """Initialize the replay buffer.
+        
+        Args:
+            max_size: Maximum number of trajectories to store
+            rng: Random number generator for sampling
+        """
+        self.max_size = max_size
+        self.rng = rng
+        self.trajectories = []
+        
+    def add(self, trajectories: Sequence[types.TrajectoryWithRew]) -> None:
+        """Add trajectories to the buffer.
+        
+        Args:
+            trajectories: Trajectories to add
+        """
+        self.trajectories.extend(trajectories)
+        if len(self.trajectories) > self.max_size:
+            # Remove oldest trajectories to maintain max_size
+            self.trajectories = self.trajectories[-self.max_size:]
+            
+    def sample(self, size: int) -> Sequence[types.TrajectoryWithRew]:
+        """Sample trajectories uniformly at random.
+        
+        Args:
+            size: Number of trajectories to sample
+            
+        Returns:
+            Sampled trajectories
+        """
+        if len(self.trajectories) == 0:
+            return []
+        indices = self.rng.choice(len(self.trajectories), size=size, replace=True)
+        return [self.trajectories[i] for i in indices]
+        
+    def get_all(self) -> Sequence[types.TrajectoryWithRew]:
+        """Get all trajectories in the buffer.
+        
+        Returns:
+            All trajectories in the buffer
+        """
+        return self.trajectories
+        
+    def __len__(self) -> int:
+        return len(self.trajectories)
 
 class PreferenceComparisons(base.BaseImitationAlgorithm):
     """Main interface for reward learning using preference comparisons."""
@@ -1499,6 +1585,8 @@ class PreferenceComparisons(base.BaseImitationAlgorithm):
         allow_variable_horizon: bool = False,
         rng: Optional[np.random.Generator] = None,
         query_schedule: Union[str, type_aliases.Schedule] = "hyperbolic",
+        sampling_strategy: str = 'random',
+        replay_buffer_size: int = 100000,
     ) -> None:
         """Initialize the preference comparison trainer.
 
@@ -1566,6 +1654,7 @@ class PreferenceComparisons(base.BaseImitationAlgorithm):
                 in `__init__()` with values from `np.linspace(0, 1, num_iterations)`
                 as input. The outputs will be normalized to sum to 1 and then used to
                 apportion the comparisons among the `num_iterations` iterations.
+            sampling_strategy: one of 'random' or 'priority'
 
         Raises:
             ValueError: if `query_schedule` is not a valid string or callable.
@@ -1651,6 +1740,13 @@ class PreferenceComparisons(base.BaseImitationAlgorithm):
         else:
             raise ValueError(f"Unknown query schedule: {query_schedule}")
 
+        if sampling_strategy not in ['random', 'priority']:
+            raise ValueError(f"Invalid sampling strategy: {sampling_strategy}, must be 'random' or 'priority'")
+        self.sampling_strategy = sampling_strategy
+        
+        # Initialize replay buffer
+        self.replay_buffer = ReplayBuffer(replay_buffer_size, self.rng)
+
         self.dataset = PreferenceDataset(max_size=comparison_queue_size)
 
     def train(
@@ -1698,7 +1794,14 @@ class PreferenceComparisons(base.BaseImitationAlgorithm):
             self.logger.log(
                 f"Collecting {2 * num_pairs} fragments ({num_steps} transitions)",
             )
+            # We always sample trajectories (randomly or prioritized) to increase the buffer size and keep the buffer clean
             trajectories = self.trajectory_generator.sample(num_steps)
+
+            # If priority sampling is used, we use all trajectories from the buffer to calculate the on-policiness.
+            if self.sampling_strategy == 'priority':
+                self.replay_buffer.add(trajectories)
+                trajectories = self.replay_buffer.get_all()
+
             # This assumes there are no fragments missing initial timesteps
             # (but allows for fragments missing terminal timesteps).
             horizons = (len(traj) for traj in trajectories if traj.terminal)

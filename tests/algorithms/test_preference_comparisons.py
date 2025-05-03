@@ -257,6 +257,8 @@ def test_preference_comparisons_raises(
             fragmenter=fragmenter,
             custom_logger=custom_logger,
             query_schedule=schedule,
+            # TODO: Add priority sampling
+            sampling_strategy="random",
             rng=rng,
         )
 
