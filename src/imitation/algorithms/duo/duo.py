@@ -28,13 +28,14 @@ class PriorityFragmenter(Fragmenter):
         self.base_algorithm = base_algorithm
         self.rng = rng
         self.fragment_length = fragment_length
+        self.device = next(base_algorithm.policy.parameters()).device
 
     def _on_policiness(self, traj: TrajectoryWithRew) -> float:
         """
         Compute O(τ) = sum_t log π(a_t | s_t) for a trajectory.
         """
-        obs = th.as_tensor(traj.obs[:-1])
-        acts = th.as_tensor(traj.acts)
+        obs = th.as_tensor(traj.obs[:-1], device=self.device)
+        acts = th.as_tensor(traj.acts, device=self.device)
         # Check policy type
         if not isinstance(self.base_algorithm.policy, ActorCriticPolicy):
             raise TypeError("The policy must be an instance of ActorCriticPolicy or a compatible subclass.")
