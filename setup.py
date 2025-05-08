@@ -197,6 +197,7 @@ setup(
     install_requires=[
         "gymnasium[classic-control]~=0.29",
         "matplotlib",
+        "kneed",
         "numpy>=1.15",
         "torch>=1.4.0",
         "tqdm",
