@@ -764,6 +764,8 @@ class UncertaintyFragmenter(Fragmenter):
         # Truncate uncertainties to match filtered_pairs length
         uncertainties = uncertainties[:len(filtered_pairs)]
 
+        self.logger.info(f"filtered {len(fragment_pairs) - len(filtered_pairs)} out of {len(fragment_pairs)} consensual pairs")
+
         if not filtered_pairs:
             return []
 

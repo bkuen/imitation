@@ -92,6 +92,7 @@ def train_preference_comparisons(
     vae_kl_weight: float,
     vae_early_stopping_patience: Optional[int],
     uncertainty_on: str,
+    uncertainty_consensual_filtering: bool,
     fragmenter_kwargs: Mapping[str, Any],
     allow_variable_horizon: bool,
     checkpoint_interval: int,
@@ -255,6 +256,7 @@ def train_preference_comparisons(
                 base_fragmenter=fragmenter,
                 fragment_sample_factor=active_selection_oversampling,
                 uncertainty_on=uncertainty_on,
+                consensual_filter=uncertainty_consensual_filtering,
                 custom_logger=custom_logger,
             )
         if variquery_enabled:
