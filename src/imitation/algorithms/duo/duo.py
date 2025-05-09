@@ -228,24 +228,37 @@ class RewardDifferenceDiversityFragmenter(Fragmenter):
         labels = kmeans.labels_
 
         # Step 5: For each cluster, select the closest query
+        # selected_indices = []
+        # for i in range(optimal_k):
+        #     cluster_idxs = np.where(labels == i)[0]
+        #     if len(cluster_idxs) == 0:
+        #         continue
+        #     center = centers[i]
+        #     dists = np.linalg.norm(diff_vecs_normalized[cluster_idxs] - center, axis=1)
+        #     closest_idx = cluster_idxs[np.argmin(dists)]
+        #     selected_indices.append(closest_idx)
+        #
+        # # Step 6: Return up to num_pairs most diverse queries
+        # if len(selected_indices) > num_pairs:
+        #     # If more than needed, pick the most uncertain (largest norm of diff_vec)
+        #     norms = [np.linalg.norm(diff_vecs[idx]) for idx in selected_indices]
+        #     top_idxs = np.argsort(norms)[-num_pairs:][::-1]
+        #     selected_indices = [selected_indices[i] for i in top_idxs]
+        # selected_pairs = [candidate_pairs[idx] for idx in selected_indices]
+
         selected_indices = []
-        for i in range(optimal_k):
-            cluster_idxs = np.where(labels == i)[0]
-            if len(cluster_idxs) == 0:
-                continue
-            center = centers[i]
-            dists = np.linalg.norm(diff_vecs_normalized[cluster_idxs] - center, axis=1)
-            closest_idx = cluster_idxs[np.argmin(dists)]
-            selected_indices.append(closest_idx)
-        
-        # Step 6: Return up to num_pairs most diverse queries
-        if len(selected_indices) > num_pairs:
-            # If more than needed, pick the most uncertain (largest norm of diff_vec)
-            norms = [np.linalg.norm(diff_vecs[idx]) for idx in selected_indices]
-            top_idxs = np.argsort(norms)[-num_pairs:][::-1]
-            selected_indices = [selected_indices[i] for i in top_idxs]
+        cluster_buckets = {i: np.where(labels == i)[0].tolist() for i in range(optimal_k)}
+        while cluster_buckets and len(selected_indices) < num_pairs:
+            for c, bucket in list(cluster_buckets.items()):
+                if bucket:
+                    selected_indices.append(bucket.pop(0))
+                if not bucket:
+                    cluster_buckets.pop(c)
+
         selected_pairs = [candidate_pairs[idx] for idx in selected_indices]
 
         self.current_iteration += 1
+
+        self.logger.log("selected_pairs by reward difference", len(selected_pairs))
 
         return selected_pairs 
