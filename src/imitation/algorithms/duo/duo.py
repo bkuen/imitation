@@ -124,6 +124,7 @@ class RewardDifferenceDiversityFragmenter(Fragmenter):
         min_k: int = 2,
         elbow_tol: float = 0.05,
         random_state: int = 42,
+        fragment_sample_factor: float = 10.0,
         custom_logger: Optional[imit_logger.HierarchicalLogger] = None,
         visualize_elbow: bool = True,
     ):
@@ -144,6 +145,7 @@ class RewardDifferenceDiversityFragmenter(Fragmenter):
         self.max_k = max_k
         self.min_k = min_k
         self.elbow_tol = elbow_tol
+        self.fragment_sample_factor = fragment_sample_factor
         self.random_state = random_state
         self.visualize_elbow = visualize_elbow
         self.elbow_visualizer = ElbowVisualizer(logger=custom_logger)
@@ -156,10 +158,12 @@ class RewardDifferenceDiversityFragmenter(Fragmenter):
         num_pairs: int,
     ) -> Sequence[TrajectoryWithRewPair]:
         # Step 1: Get candidate queries from base fragmenter
+        fragments_to_sample = int(self.fragment_sample_factor * num_pairs)
         candidate_pairs = self.base_fragmenter(
             trajectories=trajectories,
             fragment_length=fragment_length,
             num_pairs=max(self.max_k * num_pairs, num_pairs * 2),  # oversample
+            # num_pairs=fragments_to_sample,  # oversample
         )
         if len(candidate_pairs) == 0:
             return []
@@ -170,16 +174,25 @@ class RewardDifferenceDiversityFragmenter(Fragmenter):
             trans1 = rollout.flatten_trajectories([frag1])
             trans2 = rollout.flatten_trajectories([frag2])
             with th.no_grad():
-                r1 = self.preference_model.rewards(trans1).cpu().numpy().flatten()
-                r2 = self.preference_model.rewards(trans2).cpu().numpy().flatten()
-            # Pad to same length if needed
-            minlen = min(len(r1), len(r2))
-            r1, r2 = r1[:minlen], r2[:minlen]
-            diff_vecs.append(r2 - r1)
-        diff_vecs = np.stack(diff_vecs)
-
-        # Normalize diff_vecs before clustering using z-score
-        diff_vecs_normalized = (diff_vecs - diff_vecs.mean(axis=0)) / (diff_vecs.std(axis=0) + 1e-8)
+                r1 = self.preference_model.rewards(trans1)
+                r2 = self.preference_model.rewards(trans2)
+                # Pad to same length if needed
+                minlen = min(len(r1), len(r2))
+                r1, r2 = r1[:minlen], r2[:minlen]
+                diff = r2 - r1
+                # Flatten the difference vector for each pair
+                diff_vecs.append(diff.flatten())
+        
+        # Stack all differences into a single tensor
+        diff_vecs = th.stack(diff_vecs)  # Shape: (num_pairs, flattened_diff_length)
+        
+        # Normalize on GPU
+        mean = diff_vecs.mean(dim=0)
+        std = diff_vecs.std(dim=0) + 1e-8
+        diff_vecs_normalized = (diff_vecs - mean) / std
+        
+        # Move to CPU only after normalization
+        diff_vecs_normalized = diff_vecs_normalized.cpu().numpy()
 
         # Step 3: Find K using elbow method (standard)
         inertias = []
