@@ -8,8 +8,10 @@ import functools
 import pathlib
 from typing import Any, Mapping, Optional, Type, Union
 
+import os
 import numpy as np
 import torch as th
+from imitation.util.util import make_seeds
 from sacred.observers import FileStorageObserver
 from stable_baselines3.common import type_aliases
 
@@ -169,6 +171,13 @@ def train_preference_comparisons(
     Raises:
         ValueError: Inconsistency between config and deserialized policy normalization.
     """
+    seed = make_seeds(_rnd)
+    th.manual_seed(seed)
+    th.cuda.manual_seed_all(seed)
+
+    th.use_deterministic_algorithms(True)
+    os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":16:8"  # cuBLAS deterministic
+
     # This allows to specify total_timesteps, total_comparisons etc. in scientific
     # notation, which is interpreted as a float by python.
     total_timesteps = int(total_timesteps)
