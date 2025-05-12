@@ -102,6 +102,7 @@ def train_preference_comparisons(
     _rnd: np.random.Generator,
     sampling_strategy: str = 'random',
     diversity_filtering: Optional[str] = None,
+    diversity_filtering_clustering_method: str = "kmeans",
     replay_buffer_size: int = 1000000,
 ) -> Mapping[str, Any]:
     """Train a reward model using preference comparisons.
@@ -164,6 +165,8 @@ def train_preference_comparisons(
             to be better and more stable.
         _rnd: Random number generator provided by Sacred.
         sampling_strategy: Which fragment sampling strategy to use. 'random' (default) uses RandomFragmenter, 'priority' uses DUO-style PriorityFragmenter.
+        diversity_filtering: Which diversity filtering method to use. 'reward_difference' uses RewardDifferenceDiversityFragmenter.
+        diversity_filtering_clustering_method: Which clustering method to use for diversity filtering. 'kmeans' (default) uses KMeans, 'agglomerative' uses AgglomerativeClustering.
 
     Returns:
         Rollout statistics from trained policy.
@@ -296,6 +299,7 @@ def train_preference_comparisons(
                     preference_model=preference_model,
                     base_fragmenter=fragmenter,
                     custom_logger=custom_logger,
+                    clustering_method=diversity_filtering_clustering_method,
                 )
             else:
                 raise ValueError(f"Invalid diversity filtering: {diversity_filtering}")

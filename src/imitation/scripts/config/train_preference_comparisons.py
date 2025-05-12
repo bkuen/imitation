@@ -80,6 +80,7 @@ def train_defaults():
     query_schedule = "hyperbolic"
     sampling_strategy = 'random',
     diversity_filtering = None,
+    diversity_filtering_clustering_method = "kmeans",
     replay_buffer_size = 1000000
 
 

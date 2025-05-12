@@ -8,7 +8,7 @@ from imitation.data.types import TrajectoryWithRew, TrajectoryWithRewPair
 from imitation.algorithms.preference_comparisons import Fragmenter
 from stable_baselines3.common.base_class import BaseAlgorithm
 from stable_baselines3.common.policies import ActorCriticPolicy
-from sklearn.cluster import KMeans
+from sklearn.cluster import KMeans, AgglomerativeClustering
 from scipy.spatial.distance import cdist
 from imitation.data.types import TrajectoryWithRew, TrajectoryWithRewPair
 from imitation.algorithms.preference_comparisons import Fragmenter, PreferenceModel
@@ -127,6 +127,7 @@ class RewardDifferenceDiversityFragmenter(Fragmenter):
         fragment_sample_factor: float = 10.0,
         custom_logger: Optional[imit_logger.HierarchicalLogger] = None,
         visualize_elbow: bool = True,
+        clustering_method: str = "kmeans",
     ):
         """
         Args:
@@ -135,9 +136,10 @@ class RewardDifferenceDiversityFragmenter(Fragmenter):
             max_k: Maximum number of clusters to consider for elbow method.
             min_k: Minimum number of clusters to consider for elbow method.
             elbow_tol: Tolerance for elbow detection (fractional drop in inertia).
-            random_state: Random seed for KMeans.
+            random_state: Random seed for KMeans/AgglomerativeClustering.
             custom_logger: Logger.
             visualize_elbow: Whether to visualize the elbow method.
+            clustering_method: 'kmeans' (default) or 'agglomerative'. Determines which clustering algorithm to use.
         """
         super().__init__(custom_logger=custom_logger)
         self.preference_model = preference_model
@@ -150,6 +152,9 @@ class RewardDifferenceDiversityFragmenter(Fragmenter):
         self.visualize_elbow = visualize_elbow
         self.elbow_visualizer = ElbowVisualizer(logger=custom_logger)
         self.current_iteration = 0
+        self.clustering_method = clustering_method.lower()
+        if self.clustering_method not in ("kmeans", "agglomerative"):
+            raise ValueError(f"clustering_method must be 'kmeans' or 'agglomerative', got {self.clustering_method}")
 
     def __call__(
         self,
@@ -190,55 +195,54 @@ class RewardDifferenceDiversityFragmenter(Fragmenter):
         mean = diff_vecs.mean(dim=0)
         std = diff_vecs.std(dim=0) + 1e-8
         diff_vecs_normalized = (diff_vecs - mean) / std
-        
-        # Move to CPU only after normalization
         diff_vecs_normalized = diff_vecs_normalized.cpu().numpy()
 
-        # Step 3: Find K using elbow method (standard)
-        inertias = []
-        # distortions = []
-        K_range = range(self.min_k, min(self.max_k, len(diff_vecs_normalized)) + 1)
-        for k in K_range:
-            kmeans = KMeans(n_clusters=k, random_state=self.random_state, n_init=10, max_iter=300)
-            kmeans.fit(diff_vecs_normalized)
-            inertias.append(kmeans.inertia_)
-            # distortions.append(sum(np.min(cdist(diff_vecs_normalized, kmeans.cluster_centers_, 'euclidean'), axis=1) ** 2) / diff_vecs_normalized.shape[0])
+        # Step 3: Find K using elbow method (only for kmeans)
+        if self.clustering_method == "kmeans":
+            inertias = []
+            K_range = range(self.min_k, min(self.max_k, len(diff_vecs_normalized)) + 1)
+            for k in K_range:
+                kmeans = KMeans(n_clusters=k, random_state=self.random_state, n_init=10, max_iter=300)
+                kmeans.fit(diff_vecs_normalized)
+                inertias.append(kmeans.inertia_)
+            if self.visualize_elbow:
+                output_dir = self.logger.get_dir()
+                os.makedirs(output_dir, exist_ok=True)
+                plot_path = os.path.join(
+                    output_dir, 
+                    f"elbow_iteration_{self.current_iteration:04d}.png"
+                )
 
-        # Optionally visualize the elbow
-        if self.visualize_elbow:
-            # Always create visualization directory
-            output_dir = self.logger.get_dir()
-            os.makedirs(output_dir, exist_ok=True)
-
-            plot_path = os.path.join(
-                output_dir, 
-                f"elbow_iteration_{self.current_iteration:04d}.png"
-            )
-            self.elbow_visualizer.plot_elbow(
-                list(K_range), inertias, save_path=plot_path, show=False,
-                title="Elbow Method for KMeans (Reward Difference Space)"
-            )
-
-        try:
-            from kneed import KneeLocator
-            kl = KneeLocator(K_range, inertias, curve='convex', direction='decreasing')
-            optimal_k = kl.knee
-        except Exception as e:
-            self.logger.warn(f"KneeLocator failed: {e}")
-            optimal_k = None
-
-        if optimal_k is None:
-            # if no knee is found, use some reasonable default
-            max_k = min(self.max_k, len(diff_vecs_normalized))
-            optimal_k = max(self.min_k + (max_k - self.min_k) // 2 - 1, 1)
-
-        self.logger.info(f"optimal k suggested by KneeLocator: {optimal_k}")
-
-        # Step 4: Cluster with optimal k
-        kmeans = KMeans(n_clusters=optimal_k, random_state=self.random_state, n_init=10, max_iter=300)
-        kmeans.fit(diff_vecs_normalized)
-        centers = kmeans.cluster_centers_
-        labels = kmeans.labels_
+                self.elbow_visualizer.plot_elbow(
+                    list(K_range), inertias, save_path=plot_path, show=False,
+                    title="Elbow Method for KMeans (Reward Difference Space)"
+                )
+                
+            try:
+                from kneed import KneeLocator
+                kl = KneeLocator(K_range, inertias, curve='convex', direction='decreasing')
+                optimal_k = kl.knee
+            except Exception as e:
+                self.logger.warn(f"KneeLocator failed: {e}")
+                optimal_k = None
+            if optimal_k is None:
+                max_k = min(self.max_k, len(diff_vecs_normalized))
+                optimal_k = max(self.min_k + (max_k - self.min_k) // 2 - 1, 1)
+            self.logger.info(f"optimal k suggested by KneeLocator: {optimal_k}")
+            
+            clustering = KMeans(n_clusters=optimal_k, random_state=self.random_state, n_init=10, max_iter=300)
+            clustering.fit(diff_vecs_normalized)
+            labels = clustering.labels_
+            centers = clustering.cluster_centers_
+        else:  # AgglomerativeClustering
+            # For Agglomerative, user must specify n_clusters (use min(self.max_k, num_pairs, len(diff_vecs_normalized)))
+            n_clusters = min(self.max_k, num_pairs, len(diff_vecs_normalized))
+            clustering = AgglomerativeClustering(n_clusters=n_clusters)
+            labels = clustering.fit_predict(diff_vecs_normalized)
+            centers = np.array([
+                diff_vecs_normalized[labels == i].mean(axis=0) for i in range(n_clusters)
+            ])
+            self.logger.info(f"AgglomerativeClustering used with n_clusters={n_clusters}")
 
         # Step 5: For each cluster, select the closest query
         # selected_indices = []
@@ -260,7 +264,7 @@ class RewardDifferenceDiversityFragmenter(Fragmenter):
         # selected_pairs = [candidate_pairs[idx] for idx in selected_indices]
 
         selected_indices = []
-        cluster_buckets = {i: np.where(labels == i)[0].tolist() for i in range(optimal_k)}
+        cluster_buckets = {i: np.where(labels == i)[0].tolist() for i in range(len(centers))}
         while cluster_buckets and len(selected_indices) < num_pairs:
             for c, bucket in list(cluster_buckets.items()):
                 if bucket:
