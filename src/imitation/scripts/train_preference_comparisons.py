@@ -178,6 +178,11 @@ def train_preference_comparisons(
     th.manual_seed(seed)
     th.cuda.manual_seed_all(seed)
 
+    th.backends.cudnn.deterministic = True
+    th.backends.cudnn.benchmark = False
+    th.backends.cuda.matmul.allow_tf32 = False
+    th.backends.cudnn.allow_tf32 = False
+
     th.use_deterministic_algorithms(True)
     os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":16:8"  # cuBLAS deterministic
 
