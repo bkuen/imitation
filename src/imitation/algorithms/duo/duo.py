@@ -16,9 +16,9 @@ from imitation.data import rollout
 from imitation.util import logger as imit_logger
 import matplotlib.pyplot as plt
 
-class PriorityFragmenter(Fragmenter):
+class PriorityReplayBuffer:
     """
-    Fragmenter that implements DUO-style priority sampling over the replay buffer.
+    Replay buffer that implements DUO-style priority sampling.
     Trajectories are sampled with probability proportional to their on-policiness
     under the current policy, as described in Feng et al. (2025).
     """
@@ -26,18 +26,20 @@ class PriorityFragmenter(Fragmenter):
         self,
         base_algorithm: BaseAlgorithm,
         rng: np.random.Generator,
-        fragment_length: int,
+        max_size: int,
         custom_logger=None,
     ):
-        super().__init__(custom_logger)
         self.base_algorithm = base_algorithm
         self.rng = rng
-        self.fragment_length = fragment_length
+        self.max_size = max_size
         self.device = next(base_algorithm.policy.parameters()).device
+        self.trajectories = []
+        self.logger = custom_logger or imit_logger.configure()
 
     def _on_policiness(self, traj: TrajectoryWithRew) -> float:
         """
         Compute O(τ) = sum_t log π(a_t | s_t) for a trajectory.
+        Handles numerical instability by clipping log probabilities to a reasonable range.
         """
         obs = th.as_tensor(traj.obs[:-1], device=self.device)
         acts = th.as_tensor(traj.acts, device=self.device)
@@ -47,19 +49,27 @@ class PriorityFragmenter(Fragmenter):
         with th.no_grad():
             dist = self.base_algorithm.policy.get_distribution(obs)
             log_probs = dist.log_prob(acts)
+            # Clip log probabilities to avoid numerical instability
+            # -100 is a reasonable lower bound as exp(-100) ≈ 3.7e-44
+            # This prevents -inf values while still allowing very low probabilities
+            log_probs = th.clamp(log_probs, min=-100.0)
         return log_probs.sum().item()
 
-    def __call__(
-        self,
-        trajectories: Sequence[TrajectoryWithRew],
-        fragment_length: int,
-        num_pairs: int,
-    ) -> Sequence[TrajectoryWithRewPair]:
-        self.logger.log("trajectories", len(trajectories))
+    def add(self, trajectories: Sequence[TrajectoryWithRew]) -> None:
+        """Add trajectories to the buffer."""
+        self.trajectories.extend(trajectories)
+        if len(self.trajectories) > self.max_size:
+            # Remove oldest trajectories to maintain max_size
+            self.trajectories = self.trajectories[-self.max_size:]
+
+    def sample(self, size: int) -> Sequence[TrajectoryWithRew]:
+        """Sample trajectories with probability proportional to their on-policiness."""
+        if len(self.trajectories) == 0:
+            return []
 
         # Compute O(τ) for all trajectories
         on_policiness = np.array([
-            self._on_policiness(traj) for traj in trajectories
+            self._on_policiness(traj) for traj in self.trajectories
         ])
         mu = on_policiness.mean()
         sigma = on_policiness.std() + 1e-8
@@ -70,29 +80,20 @@ class PriorityFragmenter(Fragmenter):
             probs = np.ones_like(z_scores) / len(z_scores)
         else:
             probs = z_scores / z_scores.sum()
+
         # Sample trajectories with these probabilities
         sampled_indices = self.rng.choice(
-            len(trajectories), size=2 * num_pairs, p=probs
+            len(self.trajectories), size=size, p=probs
         )
-        fragments = []
-        for idx in sampled_indices:
-            traj = trajectories[idx]
-            if len(traj) < fragment_length:
-                continue  # skip too-short
-            start = self.rng.integers(0, len(traj) - fragment_length + 1)
-            end = start + fragment_length
-            fragment = TrajectoryWithRew(
-                obs=traj.obs[start:end+1],
-                acts=traj.acts[start:end],
-                infos=traj.infos[start:end] if traj.infos is not None else None,
-                rews=traj.rews[start:end],
-                terminal=(end == len(traj) and traj.terminal),
-            )
-            fragments.append(fragment)
-        # Pair up fragments
-        iterator = iter(fragments)
-        return list(zip(iterator, iterator))
-    
+        return [self.trajectories[i] for i in sampled_indices]
+
+    def get_all(self) -> Sequence[TrajectoryWithRew]:
+        """Get all trajectories in the buffer."""
+        return self.trajectories
+
+    def __len__(self) -> int:
+        return len(self.trajectories)
+
 class ElbowVisualizer:
     """Visualizes the elbow method for KMeans clustering."""
     def __init__(self, logger=None):

@@ -26,7 +26,7 @@ from imitation.scripts.ingredients import logging as logging_ingredient
 from imitation.scripts.ingredients import policy_evaluation, reward
 from imitation.scripts.ingredients import rl as rl_common
 import imitation.algorithms.variquery.variquery as variquery
-from imitation.algorithms.duo.duo import PriorityFragmenter, RewardDifferenceDiversityFragmenter
+from imitation.algorithms.duo.duo import RewardDifferenceDiversityFragmenter
 
 
 def save_model(
@@ -247,21 +247,11 @@ def train_preference_comparisons(
                 **trajectory_generator_kwargs,
             )
 
-        if sampling_strategy == 'priority':
-            fragmenter = PriorityFragmenter(
-                base_algorithm=agent,
-                rng=_rnd,
-                fragment_length=fragment_length,
-                custom_logger=custom_logger,
-            )
-        elif sampling_strategy == 'random':
-            fragmenter = preference_comparisons.RandomFragmenter(
-                **fragmenter_kwargs,
-                rng=_rnd,
-                custom_logger=custom_logger,
-            )
-        else:
-            raise ValueError(f"Invalid sampling strategy: {sampling_strategy}, must be 'random' or 'priority'")
+        fragmenter = preference_comparisons.RandomFragmenter(
+            **fragmenter_kwargs,
+            rng=_rnd,
+            custom_logger=custom_logger,
+        )
 
         preference_model = preference_comparisons.PreferenceModel(
             **preference_model_kwargs,
@@ -327,9 +317,11 @@ def train_preference_comparisons(
         main_trainer = preference_comparisons.PreferenceComparisons(
             trajectory_generator,
             reward_net,
+            rng=_rnd,
             num_iterations=num_iterations,
             fragmenter=fragmenter,
             preference_gatherer=gatherer,
+            base_algorithm=agent,
             reward_trainer=reward_trainer,
             comparison_queue_size=comparison_queue_size,
             fragment_length=fragment_length,

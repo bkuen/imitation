@@ -28,11 +28,13 @@ import numpy as np
 import torch as th
 from scipy import special
 from stable_baselines3.common import base_class, type_aliases, utils, vec_env
+from stable_baselines3.common.base_class import BaseAlgorithm
 from torch import nn
 from torch.utils import data as data_th
 from tqdm.auto import tqdm
 
 from imitation.algorithms import base
+from imitation.algorithms.duo.buffer import PriorityReplayBuffer
 from imitation.data import rollout, types, wrappers
 from imitation.data.types import (
     AnyPath,
@@ -1574,6 +1576,7 @@ class PreferenceComparisons(base.BaseImitationAlgorithm):
         self,
         trajectory_generator: TrajectoryGenerator,
         reward_model: reward_nets.RewardNet,
+        base_algorithm: BaseAlgorithm,
         num_iterations: int,
         fragmenter: Optional[Fragmenter] = None,
         preference_gatherer: Optional[PreferenceGatherer] = None,
@@ -1657,6 +1660,7 @@ class PreferenceComparisons(base.BaseImitationAlgorithm):
                 as input. The outputs will be normalized to sum to 1 and then used to
                 apportion the comparisons among the `num_iterations` iterations.
             sampling_strategy: one of 'random' or 'priority'
+            replay_buffer_size: maximum size of the replay buffer for priority sampling
 
         Raises:
             ValueError: if `query_schedule` is not a valid string or callable.
@@ -1686,11 +1690,12 @@ class PreferenceComparisons(base.BaseImitationAlgorithm):
                 "seeded fragmenter, preference gatherer, and reward_trainer. "
                 "You can initialize a random state with `np.random.default_rng(seed)`.",
             )
-        elif self.rng is not None and not has_any_rng_args_none:
-            raise ValueError(
-                "If you provide your own fragmenter, preference gatherer, "
-                "and reward trainer, you don't need to provide a random state.",
-            )
+        # TODO: Check why they put this check
+        # elif self.rng is not None and not has_any_rng_args_none:
+        #     raise ValueError(
+        #         "If you provide your own fragmenter, preference gatherer, "
+        #         "and reward trainer, you don't need to provide a random state.",
+        #     )
 
         if reward_trainer is None:
             assert self.rng is not None
@@ -1747,7 +1752,13 @@ class PreferenceComparisons(base.BaseImitationAlgorithm):
         self.sampling_strategy = sampling_strategy
         
         # Initialize replay buffer
-        self.replay_buffer = ReplayBuffer(replay_buffer_size, self.rng)
+        assert self.rng is not None
+        self.replay_buffer = PriorityReplayBuffer(
+            base_algorithm=base_algorithm,
+            rng=self.rng,
+            max_size=replay_buffer_size,
+            custom_logger=self.logger,
+        )
 
         self.dataset = PreferenceDataset(max_size=comparison_queue_size)
 
@@ -1796,13 +1807,15 @@ class PreferenceComparisons(base.BaseImitationAlgorithm):
             self.logger.log(
                 f"Collecting {2 * num_pairs} fragments ({num_steps} transitions)",
             )
-            # We always sample trajectories (randomly or prioritized) to increase the buffer size and keep the buffer clean
+            # We always sample trajectories to increase the buffer size
             trajectories = self.trajectory_generator.sample(num_steps)
+           
 
-            # If priority sampling is used, we use all trajectories from the buffer to calculate the on-policiness.
+            #If priority sampling is used, we sample trajectories from the buffer
             if self.sampling_strategy == 'priority':
                 self.replay_buffer.add(trajectories)
-                trajectories = self.replay_buffer.get_all()
+                trajectories = self.replay_buffer.sample(num_steps)
+    
 
             # This assumes there are no fragments missing initial timesteps
             # (but allows for fragments missing terminal timesteps).
