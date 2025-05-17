@@ -174,17 +174,17 @@ def train_preference_comparisons(
     Raises:
         ValueError: Inconsistency between config and deserialized policy normalization.
     """
-    seed = make_seeds(_rnd)
-    th.manual_seed(seed)
-    th.cuda.manual_seed_all(seed)
-
-    th.backends.cudnn.deterministic = True
-    th.backends.cudnn.benchmark = False
-    th.backends.cuda.matmul.allow_tf32 = False
-    th.backends.cudnn.allow_tf32 = False
-
-    th.use_deterministic_algorithms(True)
-    os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":16:8"  # cuBLAS deterministic
+    # seed = make_seeds(_rnd)
+    # th.manual_seed(seed)
+    # th.cuda.manual_seed_all(seed)
+    #
+    # th.backends.cudnn.deterministic = True
+    # th.backends.cudnn.benchmark = False
+    # th.backends.cuda.matmul.allow_tf32 = False
+    # th.backends.cudnn.allow_tf32 = False
+    #
+    # th.use_deterministic_algorithms(True)
+    # os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":16:8"  # cuBLAS deterministic
 
     # This allows to specify total_timesteps, total_comparisons etc. in scientific
     # notation, which is interpreted as a float by python.

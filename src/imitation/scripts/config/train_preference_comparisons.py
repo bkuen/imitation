@@ -61,9 +61,9 @@ def train_defaults():
     variquery_num_clusters = 3
     vae_latent_dim = 16
     vae_hidden_dims = [128, 64, 32]
-    vae_lr = 1e-3,
-    vae_kl_weight = 1.0,
-    vae_batch_size = 32,
+    vae_lr = 1e-3
+    vae_kl_weight = 1.0
+    vae_batch_size = 32
     vae_epochs = 10
     vae_early_stopping_patience = None,
     uncertainty_on = "logit"
@@ -78,9 +78,9 @@ def train_defaults():
 
     checkpoint_interval = 0  # Num epochs between saving (<0 disables, =0 final only)
     query_schedule = "hyperbolic"
-    sampling_strategy = 'random',
-    diversity_filtering = None,
-    diversity_filtering_clustering_method = "kmeans",
+    sampling_strategy = 'random'
+    diversity_filtering = None
+    diversity_filtering_clustering_method = "kmeans"
     replay_buffer_size = 1000000
 
 
