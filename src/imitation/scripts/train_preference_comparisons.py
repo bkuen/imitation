@@ -93,6 +93,7 @@ def train_preference_comparisons(
     vae_lr: float,
     vae_kl_weight: float,
     vae_early_stopping_patience: Optional[int],
+    vae_mode: str,
     uncertainty_on: str,
     uncertainty_consensual_filtering: bool,
     fragmenter_kwargs: Mapping[str, Any],
@@ -284,6 +285,7 @@ def train_preference_comparisons(
                 vae_kl_weight=vae_kl_weight,
                 vae_batch_size=vae_batch_size,
                 vae_early_stopping_patience=vae_early_stopping_patience,
+                vae_mode=vae_mode,
                 custom_logger=custom_logger,
                 device=agent_trainer.algorithm.device,
             )

@@ -274,6 +274,7 @@ class VARIQueryFragmenter(Fragmenter):
         fragment_sample_factor: float = 2.0,
         device: str = "cuda" if th.cuda.is_available() else "cpu",
         visualization_interval: int = 10,
+        vae_mode: str = "state",  # New parameter: "state" or "state_reward"
     ):
         super().__init__(custom_logger)
         self.allow_variable_horizon = allow_variable_horizon
@@ -281,6 +282,7 @@ class VARIQueryFragmenter(Fragmenter):
         self.fragment_sample_factor = fragment_sample_factor
         self.visualization_interval = visualization_interval
         self.visualizer = ClusterVisualizer(custom_logger)
+        self.vae_mode = vae_mode
         
         # Use provided base_fragmenter or create default RandomFragmenter
         self.base_fragmenter = base_fragmenter or RandomFragmenter(
@@ -301,13 +303,25 @@ class VARIQueryFragmenter(Fragmenter):
         self.vae_early_stopping_patience = vae_early_stopping_patience
         self.device = device
         
-        self.vae = MLPStateVAE(
-            state_dim=state_dim,
-            sequence_length=sequence_length,
-            latent_dim=vae_latent_dim,
-            hidden_dims=vae_hidden_dims,
-            custom_logger=self.logger,
-        )
+        # Create appropriate VAE based on mode
+        if vae_mode == "state":
+            self.vae = MLPStateVAE(
+                state_dim=state_dim,
+                sequence_length=sequence_length,
+                latent_dim=vae_latent_dim,
+                hidden_dims=vae_hidden_dims,
+                custom_logger=self.logger,
+            )
+        elif vae_mode == "state_reward":
+            self.vae = MLPStateRewardCVAE(
+                state_dim=state_dim,
+                sequence_length=sequence_length,
+                latent_dim=vae_latent_dim,
+                hidden_dims=vae_hidden_dims,
+                custom_logger=self.logger,
+            )
+        else:
+            raise ValueError(f"Invalid VAE mode: {vae_mode}. Must be either 'state' or 'state_reward'")
 
     def __call__(
         self,
@@ -388,7 +402,21 @@ class VARIQueryFragmenter(Fragmenter):
 
         x = segments.as_tensor().to(self.device)
         self.logger.info("stacked segments, shape: {}".format(x.shape))
-        _, _, z = self.vae.encode(x)
+        
+        if self.vae_mode == "state":
+            _, _, z = self.vae.encode(x)
+        else:  # state_reward mode
+            # Get predicted rewards using preference model
+            trans = rollout.flatten_trajectories(segments.fragments)
+            predicted_rewards = self.preference_model.rewards(trans)
+            
+            # Reshape rewards to match sequence length
+            batch_size = len(segments.fragments)
+            rewards = predicted_rewards.view(batch_size, -1)
+            
+            self.logger.info("predicted rewards shape: {}".format(rewards.shape))
+            _, _, z = self.vae.encode(x, rewards)
+            
         return z
 
         # return [self.vae.encode(segment) for segment in segments]
@@ -520,9 +548,10 @@ class VARIQueryFragmenter(Fragmenter):
         # Train the VAE
         trainer.train(dataset)
 
-class MLPStateVAE(nn.Module):
+class MLPVae(nn.Module):
     """
-    State VAE for the VARIQuery algorithm.
+    Base class for MLP-based Variational Autoencoders.
+    Contains common functionality shared between different VAE implementations.
     """
 
     def __init__(
@@ -542,12 +571,44 @@ class MLPStateVAE(nn.Module):
         self.flat_dim = state_dim * sequence_length
         self.logger = custom_logger or imit_logger.configure()
 
-        self.encoder = self._create_encoder()
-        self.decoder = self._create_decoder()
-
         # Latent space projections
         self.fc_mu = nn.Linear(hidden_dims[-1], latent_dim)
         self.fc_logvar = nn.Linear(hidden_dims[-1], latent_dim)
+
+    def reparameterize(self, mu: th.Tensor, logvar: th.Tensor) -> th.Tensor:
+        """Reparameterization trick to sample from the latent space
+        
+        Args:
+            mu: (batch_size, latent_dim)
+            logvar: (batch_size, latent_dim)
+        """
+        std = th.exp(0.5 * logvar)
+        eps = th.randn_like(std)
+        return mu + eps * std
+
+class MLPStateVAE(MLPVae):
+    """
+    State VAE for the VARIQuery algorithm.
+    """
+
+    def __init__(
+        self,
+        state_dim: int,
+        sequence_length: int,
+        latent_dim: int,
+        hidden_dims: List[int] = [128, 64, 32],
+        custom_logger: Optional[imit_logger.HierarchicalLogger] = None,
+    ):
+        super().__init__(
+            state_dim=state_dim,
+            sequence_length=sequence_length,
+            latent_dim=latent_dim,
+            hidden_dims=hidden_dims,
+            custom_logger=custom_logger,
+        )
+
+        self.encoder = self._create_encoder()
+        self.decoder = self._create_decoder()
 
     def _create_encoder(self):
         encoder_layers = []
@@ -575,14 +636,14 @@ class MLPStateVAE(nn.Module):
         ])
         return nn.Sequential(*decoder_layers)
     
-    def encode(self, x: th.Tensor) -> th.Tensor:
+    def encode(self, x: th.Tensor) -> Tuple[th.Tensor, th.Tensor, th.Tensor]:
         """Encode state segments into latent space
         
         Args:
             x: (batch_size, fragment_length, state_dim)
 
         Returns:
-            Tuple of (mu, logvar) each of shape (batch_size, latent_dim)
+            Tuple of (mu, logvar, z) each of shape (batch_size, latent_dim)
         """
         self.logger.info("encode state segments, shape: {}".format(x.shape))
 
@@ -602,17 +663,6 @@ class MLPStateVAE(nn.Module):
         self.logger.info("latent space, shape: {}".format(z.shape))
 
         return mu, logvar, z
-    
-    def reparameterize(self, mu: th.Tensor, logvar: th.Tensor) -> th.Tensor:
-        """Reparameterization trick to sample from the latent space
-        
-        Args:
-            mu: (batch_size, latent_dim)
-            logvar: (batch_size, latent_dim)
-        """
-        std = th.exp(0.5 * logvar)
-        eps = th.randn_like(std)
-        return mu + eps * std
     
     def decode(self, z: th.Tensor) -> th.Tensor:
         """Decode latent space samples into state segments
@@ -644,7 +694,152 @@ class MLPStateVAE(nn.Module):
         x_reconstructed = self.decode(z)
 
         return x_reconstructed, mu, logvar
+
+class MLPStateRewardCVAE(MLPVae):
+    """
+    Conditional VAE for encoding states based on rewards.
+    This model takes both state sequences and their corresponding reward sequences as input.
+    """
+
+    def __init__(
+        self,
+        state_dim: int,
+        sequence_length: int,
+        latent_dim: int,
+        hidden_dims: List[int] = [128, 64, 32],
+        custom_logger: Optional[imit_logger.HierarchicalLogger] = None,
+    ):
+        super().__init__(
+            state_dim=state_dim,
+            sequence_length=sequence_length,
+            latent_dim=latent_dim,
+            hidden_dims=hidden_dims,
+            custom_logger=custom_logger,
+        )
+
+        self.encoder = self._create_encoder()
+        self.decoder = self._create_decoder()
+
+    def _create_encoder(self):
+        encoder_layers = []
+        # Input dimension includes both flattened states and flattened rewards
+        in_dim = self.flat_dim + self.sequence_length  # +sequence_length for the reward sequence
+        for hidden_dim in self.hidden_dims:
+            encoder_layers.extend([
+                nn.Linear(in_dim, hidden_dim),
+                nn.ReLU(),
+            ])
+            in_dim = hidden_dim
+        return nn.Sequential(*encoder_layers)
     
+    def _create_decoder(self):
+        decoder_layers = []
+        # Input dimension includes both latent vector and flattened rewards
+        in_dim = self.latent_dim + self.sequence_length  # +sequence_length for the reward sequence
+        for hidden_dim in reversed(self.hidden_dims):
+            decoder_layers.extend([
+                nn.Linear(in_dim, hidden_dim),
+                nn.ReLU(),
+            ])
+            in_dim = hidden_dim
+        decoder_layers.extend([
+            nn.Linear(in_dim, self.flat_dim),
+            # No activation - raw outputs for MSE loss
+        ])
+        return nn.Sequential(*decoder_layers)
+    
+    def encode(self, x: th.Tensor, rewards: th.Tensor) -> Tuple[th.Tensor, th.Tensor, th.Tensor]:
+        """Encode state segments into latent space conditioned on reward sequence
+        
+        Args:
+            x: (batch_size, fragment_length, state_dim)
+            rewards: (batch_size, fragment_length) reward sequence for each trajectory
+
+        Returns:
+            Tuple of (mu, logvar, z) each of shape (batch_size, latent_dim)
+        """
+        self.logger.info("encode state segments, shape: {}".format(x.shape))
+        self.logger.info("encode reward sequences, shape: {}".format(rewards.shape))
+
+        # Flatten input: (batch, seq_len, state_dim)
+        x_flat = x.view(x.shape[0], -1)
+        self.logger.info("flattened state segments, shape: {}".format(x_flat.shape))
+
+        # Ensure rewards are properly shaped
+        if rewards.dim() == 1:
+            rewards = rewards.unsqueeze(1)  # Add sequence dimension if missing
+        if rewards.shape[1] != self.sequence_length:
+            # If rewards are not the right length, pad or truncate
+            if rewards.shape[1] > self.sequence_length:
+                rewards = rewards[:, :self.sequence_length]
+            else:
+                padding = th.zeros(rewards.shape[0], self.sequence_length - rewards.shape[1], device=rewards.device)
+                rewards = th.cat([rewards, padding], dim=1)
+
+        # Concatenate flattened states with flattened rewards
+        x_with_rewards = th.cat([x_flat, rewards], dim=1)
+        self.logger.info("concatenated with rewards, shape: {}".format(x_with_rewards.shape))
+
+        # Encode
+        hidden = self.encoder(x_with_rewards)
+        self.logger.info("encoded state segments, shape: {}".format(hidden.shape))
+
+        mu = self.fc_mu(hidden)
+        logvar = self.fc_logvar(hidden)
+
+        z = self.reparameterize(mu, logvar)
+
+        self.logger.info("latent space, shape: {}".format(z.shape))
+
+        return mu, logvar, z
+    
+    def decode(self, z: th.Tensor, rewards: th.Tensor) -> th.Tensor:
+        """Decode latent space samples into state segments conditioned on reward sequence
+        
+        Args:
+            z: Tensor of shape (batch_size, latent_dim)
+            rewards: Tensor of shape (batch_size, sequence_length) reward sequence
+
+        Returns:
+            Tensor of shape (batch_size, sequence_length, state_dim)
+        """
+        # Ensure rewards are properly shaped
+        if rewards.dim() == 1:
+            rewards = rewards.unsqueeze(1)  # Add sequence dimension if missing
+        if rewards.shape[1] != self.sequence_length:
+            # If rewards are not the right length, pad or truncate
+            if rewards.shape[1] > self.sequence_length:
+                rewards = rewards[:, :self.sequence_length]
+            else:
+                padding = th.zeros(rewards.shape[0], self.sequence_length - rewards.shape[1], device=rewards.device)
+                rewards = th.cat([rewards, padding], dim=1)
+
+        # Concatenate latent vector with flattened rewards
+        z_with_rewards = th.cat([z, rewards], dim=1)
+        
+        # Decode to flattened state segments
+        x_flat = self.decoder(z_with_rewards)
+        
+        # Reshape to (batch_size, sequence_length, state_dim)
+        x = x_flat.view(-1, self.sequence_length, self.state_dim)
+
+        return x
+    
+    def forward(self, x: th.Tensor, rewards: th.Tensor) -> Tuple[th.Tensor, th.Tensor, th.Tensor]:
+        """Forward pass through CVAE
+        
+        Args:
+            x: Tensor of shape (batch_size, sequence_length, state_dim)
+            rewards: Tensor of shape (batch_size, sequence_length) reward sequence
+            
+        Returns:
+            Tuple of (x_reconstructed, mu, logvar)
+        """
+        mu, logvar, z = self.encode(x, rewards)
+        x_reconstructed = self.decode(z, rewards)
+
+        return x_reconstructed, mu, logvar
+
 class VAETrainer:
     """Trainer for the VAE"""
 
@@ -652,7 +847,7 @@ class VAETrainer:
 
     def __init__(
         self,
-        vae: MLPStateVAE,
+        vae: MLPVae,
         epochs: int,
         device: str = "cuda" if th.cuda.is_available() else "cpu",
         lr: float = 1e-3,
@@ -666,7 +861,7 @@ class VAETrainer:
         """Initialize the VAETrainer
         
         Args:
-            vae: The VAE to train
+            vae: The VAE to train (either MLPStateVAE or MLPStateRewardCVAE)
             epochs: The number of epochs to train for
             device: The device to run the training on
             lr: The learning rate
@@ -688,6 +883,9 @@ class VAETrainer:
             if regularizer_factory is not None
             else None
         )
+        
+        # Check if we're using a CVAE
+        self.is_cvae = isinstance(vae, MLPStateRewardCVAE)
 
     def train(
         self,
@@ -729,19 +927,28 @@ class VAETrainer:
             DataLoader for the dataset
         """
         class TensorDataset(data_th.Dataset):
-          def __init__(self, state_dataset: StateSegmentDataset):
-              self.state_dataset = state_dataset
+            def __init__(self, state_dataset: StateSegmentDataset, is_cvae: bool):
+                self.state_dataset = state_dataset
+                self.is_cvae = is_cvae
 
-          def __len__(self):
-              return len(self.state_dataset)
+            def __len__(self):
+                return len(self.state_dataset)
 
-          def __getitem__(self, idx):
-              return self.state_dataset.get_tensor(idx)
+            def __getitem__(self, idx):
+                if self.is_cvae:
+                    # For CVAE, return both states and rewards
+                    states = self.state_dataset.get_tensor(idx)
+                    # Convert rewards to float32
+                    rewards = th.tensor(self.state_dataset.fragments[idx].rews, dtype=th.float32)
+                    return states, rewards
+                else:
+                    # For regular VAE, just return states
+                    return self.state_dataset.get_tensor(idx)
 
-        tensor_dataset = TensorDataset(dataset)
+        tensor_dataset = TensorDataset(dataset, self.is_cvae)
 
         if len(tensor_dataset) < self.batch_size:
-          raise ValueError(f"Dataset size ({len(tensor_dataset)}) is smaller than batch_size ({self.batch_size})")
+            raise ValueError(f"Dataset size ({len(tensor_dataset)}) is smaller than batch_size ({self.batch_size})")
 
         return data_th.DataLoader(
             tensor_dataset,
@@ -803,14 +1010,20 @@ class VAETrainer:
         num_batches = 0
 
         for batch in train_loader:
-            batch = batch.to(self.device)
-
-            # Forward pass
-            x_reconstructed, mu, logvar = self.vae(batch)
+            if self.is_cvae:
+                x, rewards = batch
+                x = x.to(self.device).float()  # Ensure float32
+                rewards = rewards.to(self.device).float()  # Ensure float32
+                # Forward pass
+                x_reconstructed, mu, logvar = self.vae(x, rewards)
+            else:
+                x = batch.to(self.device).float()  # Ensure float32
+                # Forward pass
+                x_reconstructed, mu, logvar = self.vae(x)
 
             # Compute loss
             loss, recon_loss, kl_loss = self._vae_loss(
-                x=batch,
+                x=x,
                 mu=mu,
                 logvar=logvar,
                 x_reconstructed=x_reconstructed,
@@ -839,9 +1052,9 @@ class VAETrainer:
         avg_recon_loss = total_recon_loss / num_batches
         avg_kl_loss = total_kl_loss / num_batches
         with self.logger.add_key_prefix("train"):
-          self.logger.log("loss", avg_loss)
-          self.logger.log("recon_loss", avg_recon_loss)
-          self.logger.log("kl_loss", avg_kl_loss)
+            self.logger.log("loss", avg_loss)
+            self.logger.log("recon_loss", avg_recon_loss)
+            self.logger.log("kl_loss", avg_kl_loss)
             
         # Validation loop
         val_loss = None
@@ -849,7 +1062,7 @@ class VAETrainer:
             val_loss = self._validate(val_loader)
 
         if self.regularizer is not None:
-          self.regularizer.update_params(avg_loss, val_loss)
+            self.regularizer.update_params(avg_loss, val_loss)
 
         return avg_loss, val_loss
 
@@ -873,14 +1086,20 @@ class VAETrainer:
         num_val_batches = 0
 
         for batch in val_loader:
-            batch = batch.to(self.device)
+            if self.is_cvae:
+                x, rewards = batch
+                x = x.to(self.device).float()  # Ensure float32
+                rewards = rewards.to(self.device).float()  # Ensure float32
+                # Forward pass
+                x_reconstructed, mu, logvar = self.vae(x, rewards)
+            else:
+                x = batch.to(self.device).float()  # Ensure float32
+                # Forward pass
+                x_reconstructed, mu, logvar = self.vae(x)
             
-            # Forward pass
-            x_reconstructed, mu, logvar = self.vae(batch)
-
             # Compute loss
             loss, recon_loss, kl_loss = self._vae_loss(
-                x=batch,
+                x=x,
                 mu=mu,
                 logvar=logvar,
                 x_reconstructed=x_reconstructed,
@@ -900,12 +1119,11 @@ class VAETrainer:
         avg_kl_loss = val_kl_loss / num_val_batches
 
         with self.logger.add_key_prefix("val"):
-          self.logger.log("loss", avg_loss)
-          self.logger.log("recon_loss", avg_recon_loss)
-          self.logger.log("kl_loss", avg_kl_loss)
+            self.logger.log("loss", avg_loss)
+            self.logger.log("recon_loss", avg_recon_loss)
+            self.logger.log("kl_loss", avg_kl_loss)
 
         return avg_loss
-        
 
     def _vae_loss(
         self, 
