@@ -717,13 +717,21 @@ class MLPStateRewardCVAE(MLPVae):
             custom_logger=custom_logger,
         )
 
+        # Create encoder and decoder
         self.encoder = self._create_encoder()
         self.decoder = self._create_decoder()
+        
+        # Reward conditioning layers
+        self.reward_conditioning = nn.Sequential(
+            nn.Linear(sequence_length, hidden_dims[0]),
+            nn.ReLU(),
+            nn.Linear(hidden_dims[0], hidden_dims[-1]),
+            nn.Sigmoid()  # Use sigmoid to create a gating mechanism
+        )
 
     def _create_encoder(self):
         encoder_layers = []
-        # Input dimension includes both flattened states and flattened rewards
-        in_dim = self.flat_dim + self.sequence_length  # +sequence_length for the reward sequence
+        in_dim = self.flat_dim
         for hidden_dim in self.hidden_dims:
             encoder_layers.extend([
                 nn.Linear(in_dim, hidden_dim),
@@ -734,8 +742,7 @@ class MLPStateRewardCVAE(MLPVae):
     
     def _create_decoder(self):
         decoder_layers = []
-        # Input dimension includes both latent vector and flattened rewards
-        in_dim = self.latent_dim + self.sequence_length  # +sequence_length for the reward sequence
+        in_dim = self.latent_dim
         for hidden_dim in reversed(self.hidden_dims):
             decoder_layers.extend([
                 nn.Linear(in_dim, hidden_dim),
@@ -744,7 +751,6 @@ class MLPStateRewardCVAE(MLPVae):
             in_dim = hidden_dim
         decoder_layers.extend([
             nn.Linear(in_dim, self.flat_dim),
-            # No activation - raw outputs for MSE loss
         ])
         return nn.Sequential(*decoder_layers)
     
@@ -758,43 +764,38 @@ class MLPStateRewardCVAE(MLPVae):
         Returns:
             Tuple of (mu, logvar, z) each of shape (batch_size, latent_dim)
         """
-        self.logger.info("encode state segments, shape: {}".format(x.shape))
-        self.logger.info("encode reward sequences, shape: {}".format(rewards.shape))
-
         # Flatten input: (batch, seq_len, state_dim)
         x_flat = x.view(x.shape[0], -1)
-        self.logger.info("flattened state segments, shape: {}".format(x_flat.shape))
-
+        
         # Ensure rewards are properly shaped
         if rewards.dim() == 1:
-            rewards = rewards.unsqueeze(1)  # Add sequence dimension if missing
+            rewards = rewards.unsqueeze(1)
         if rewards.shape[1] != self.sequence_length:
-            # If rewards are not the right length, pad or truncate
             if rewards.shape[1] > self.sequence_length:
                 rewards = rewards[:, :self.sequence_length]
             else:
                 padding = th.zeros(rewards.shape[0], self.sequence_length - rewards.shape[1], device=rewards.device)
                 rewards = th.cat([rewards, padding], dim=1)
 
-        # Concatenate flattened states with flattened rewards
-        x_with_rewards = th.cat([x_flat, rewards], dim=1)
-        self.logger.info("concatenated with rewards, shape: {}".format(x_with_rewards.shape))
-
-        # Encode
-        hidden = self.encoder(x_with_rewards)
-        self.logger.info("encoded state segments, shape: {}".format(hidden.shape))
-
-        mu = self.fc_mu(hidden)
-        logvar = self.fc_logvar(hidden)
-
+        # Encode states
+        state_features = self.encoder(x_flat)
+        
+        # Create reward conditioning
+        reward_features = self.reward_conditioning(rewards)
+        
+        # Apply reward conditioning to state features
+        conditioned_features = state_features * reward_features
+        
+        # Map to latent space
+        mu = self.fc_mu(conditioned_features)
+        logvar = self.fc_logvar(conditioned_features)
+        
         z = self.reparameterize(mu, logvar)
-
-        self.logger.info("latent space, shape: {}".format(z.shape))
-
+        
         return mu, logvar, z
     
     def decode(self, z: th.Tensor, rewards: th.Tensor) -> th.Tensor:
-        """Decode latent space samples into state segments conditioned on reward sequence
+        """Decode latent space samples into state segments
         
         Args:
             z: Tensor of shape (batch_size, latent_dim)
@@ -803,26 +804,12 @@ class MLPStateRewardCVAE(MLPVae):
         Returns:
             Tensor of shape (batch_size, sequence_length, state_dim)
         """
-        # Ensure rewards are properly shaped
-        if rewards.dim() == 1:
-            rewards = rewards.unsqueeze(1)  # Add sequence dimension if missing
-        if rewards.shape[1] != self.sequence_length:
-            # If rewards are not the right length, pad or truncate
-            if rewards.shape[1] > self.sequence_length:
-                rewards = rewards[:, :self.sequence_length]
-            else:
-                padding = th.zeros(rewards.shape[0], self.sequence_length - rewards.shape[1], device=rewards.device)
-                rewards = th.cat([rewards, padding], dim=1)
-
-        # Concatenate latent vector with flattened rewards
-        z_with_rewards = th.cat([z, rewards], dim=1)
-        
         # Decode to flattened state segments
-        x_flat = self.decoder(z_with_rewards)
+        x_flat = self.decoder(z)
         
         # Reshape to (batch_size, sequence_length, state_dim)
         x = x_flat.view(-1, self.sequence_length, self.state_dim)
-
+        
         return x
     
     def forward(self, x: th.Tensor, rewards: th.Tensor) -> Tuple[th.Tensor, th.Tensor, th.Tensor]:
@@ -837,7 +824,7 @@ class MLPStateRewardCVAE(MLPVae):
         """
         mu, logvar, z = self.encode(x, rewards)
         x_reconstructed = self.decode(z, rewards)
-
+        
         return x_reconstructed, mu, logvar
 
 class VAETrainer:
