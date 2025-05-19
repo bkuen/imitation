@@ -698,7 +698,7 @@ class MLPStateVAE(MLPVae):
 class MLPStateRewardCVAE(MLPVae):
     """
     Enhanced Conditional VAE for encoding states based on rewards.
-    Uses temporal reward structure and attention mechanisms for better conditioning.
+    Uses hierarchical reward processing and multi-scale attention mechanisms.
     """
 
     def __init__(
@@ -721,9 +721,9 @@ class MLPStateRewardCVAE(MLPVae):
         self.encoder = self._create_encoder()
         self.decoder = self._create_decoder()
         
-        # Reward processing network - now takes 3x sequence_length (raw, diff, cumulative)
-        self.reward_processor = nn.Sequential(
-            nn.Linear(sequence_length * 3, hidden_dims[0]),
+        # Hierarchical reward processing networks
+        self.short_term_processor = nn.Sequential(
+            nn.Linear(sequence_length * 2, hidden_dims[0]),  # *2 for rewards and differences
             nn.LayerNorm(hidden_dims[0]),
             nn.ReLU(),
             nn.Linear(hidden_dims[0], hidden_dims[-1]),
@@ -731,12 +731,41 @@ class MLPStateRewardCVAE(MLPVae):
             nn.ReLU()
         )
         
-        # Attention mechanism for reward-state interaction
-        self.attention = nn.Sequential(
+        self.medium_term_processor = nn.Sequential(
+            nn.Linear(sequence_length, hidden_dims[0]),
+            nn.LayerNorm(hidden_dims[0]),
+            nn.ReLU(),
+            nn.Linear(hidden_dims[0], hidden_dims[-1]),
+            nn.LayerNorm(hidden_dims[-1]),
+            nn.ReLU()
+        )
+        
+        self.long_term_processor = nn.Sequential(
+            nn.Linear(sequence_length, hidden_dims[0]),
+            nn.LayerNorm(hidden_dims[0]),
+            nn.ReLU(),
+            nn.Linear(hidden_dims[0], hidden_dims[-1]),
+            nn.LayerNorm(hidden_dims[-1]),
+            nn.ReLU()
+        )
+        
+        # Scale weighting network
+        self.scale_weights = nn.Sequential(
+            nn.Linear(hidden_dims[-1] * 3, hidden_dims[-1]),
+            nn.LayerNorm(hidden_dims[-1]),
+            nn.ReLU(),
+            nn.Linear(hidden_dims[-1], 3),
+            nn.Softmax(dim=1)
+        )
+        
+        # State-reward interaction network
+        self.state_reward_interaction = nn.Sequential(
             nn.Linear(hidden_dims[-1] * 2, hidden_dims[-1]),
-            nn.Tanh(),
-            nn.Linear(hidden_dims[-1], 1),
-            nn.Sigmoid()
+            nn.LayerNorm(hidden_dims[-1]),
+            nn.ReLU(),
+            nn.Linear(hidden_dims[-1], hidden_dims[-1]),
+            nn.LayerNorm(hidden_dims[-1]),
+            nn.ReLU()
         )
         
         # Final conditioning layer
@@ -746,34 +775,8 @@ class MLPStateRewardCVAE(MLPVae):
             nn.ReLU()
         )
 
-    def _process_rewards(self, rewards: th.Tensor) -> th.Tensor:
-        """Process rewards to include temporal information
-        
-        Args:
-            rewards: Tensor of shape (batch_size, sequence_length)
-            
-        Returns:
-            Tensor of shape (batch_size, sequence_length * 3) containing:
-            - Raw rewards
-            - Reward differences
-            - Cumulative rewards
-        """
-        # Compute reward differences
-        reward_diffs = th.zeros_like(rewards)
-        reward_diffs[:, 1:] = rewards[:, 1:] - rewards[:, :-1]
-        
-        # Compute cumulative rewards
-        cum_rewards = th.cumsum(rewards, dim=1)
-        
-        # Normalize each component
-        rewards_norm = (rewards - rewards.mean(dim=1, keepdim=True)) / (rewards.std(dim=1, keepdim=True) + 1e-8)
-        reward_diffs_norm = (reward_diffs - reward_diffs.mean(dim=1, keepdim=True)) / (reward_diffs.std(dim=1, keepdim=True) + 1e-8)
-        cum_rewards_norm = (cum_rewards - cum_rewards.mean(dim=1, keepdim=True)) / (cum_rewards.std(dim=1, keepdim=True) + 1e-8)
-        
-        # Concatenate all reward information
-        return th.cat([rewards_norm, reward_diffs_norm, cum_rewards_norm], dim=1)
-
     def _create_encoder(self):
+        """Create the encoder network with residual connections"""
         encoder_layers = []
         in_dim = self.flat_dim
         for i, hidden_dim in enumerate(self.hidden_dims):
@@ -790,6 +793,7 @@ class MLPStateRewardCVAE(MLPVae):
         return nn.Sequential(*encoder_layers)
     
     def _create_decoder(self):
+        """Create the decoder network with residual connections"""
         decoder_layers = []
         in_dim = self.latent_dim
         for i, hidden_dim in enumerate(reversed(self.hidden_dims)):
@@ -807,7 +811,39 @@ class MLPStateRewardCVAE(MLPVae):
             nn.Linear(in_dim, self.flat_dim),
         ])
         return nn.Sequential(*decoder_layers)
-    
+
+    def _process_rewards(self, rewards: th.Tensor) -> Tuple[th.Tensor, th.Tensor, th.Tensor]:
+        """Process rewards at multiple time scales
+        
+        Args:
+            rewards: Tensor of shape (batch_size, sequence_length)
+            
+        Returns:
+            Tuple of (short_term, medium_term, long_term) features
+        """
+        # Short-term: immediate rewards and differences
+        reward_diffs = th.zeros_like(rewards)
+        reward_diffs[:, 1:] = rewards[:, 1:] - rewards[:, :-1]
+        short_term = th.cat([rewards, reward_diffs], dim=1)  # Shape: (batch_size, sequence_length * 2)
+        
+        # Medium-term: moving averages
+        window_size = max(3, self.sequence_length // 4)
+        medium_term = th.zeros_like(rewards)
+        for i in range(self.sequence_length):
+            start = max(0, i - window_size + 1)
+            medium_term[:, i] = rewards[:, start:i+1].mean(dim=1)
+        
+        # Long-term: cumulative rewards and trends
+        cum_rewards = th.cumsum(rewards, dim=1)
+        long_term = cum_rewards / th.arange(1, self.sequence_length + 1, device=rewards.device)
+        
+        # Normalize each component
+        short_term = (short_term - short_term.mean(dim=1, keepdim=True)) / (short_term.std(dim=1, keepdim=True) + 1e-8)
+        medium_term = (medium_term - medium_term.mean(dim=1, keepdim=True)) / (medium_term.std(dim=1, keepdim=True) + 1e-8)
+        long_term = (long_term - long_term.mean(dim=1, keepdim=True)) / (long_term.std(dim=1, keepdim=True) + 1e-8)
+        
+        return short_term, medium_term, long_term
+
     def encode(self, x: th.Tensor, rewards: th.Tensor) -> Tuple[th.Tensor, th.Tensor, th.Tensor]:
         """Encode state segments into latent space conditioned on reward sequence
         
@@ -834,21 +870,33 @@ class MLPStateRewardCVAE(MLPVae):
         # Encode states
         state_features = self.encoder(x_flat)
         
-        # Process rewards with temporal information
-        processed_rewards = self._process_rewards(rewards)
-        reward_features = self.reward_processor(processed_rewards)
+        # Process rewards at multiple time scales
+        short_term, medium_term, long_term = self._process_rewards(rewards)
         
-        # Compute attention weights
-        combined = th.cat([state_features, reward_features], dim=1)
-        attention_weights = self.attention(combined)
+        # Process each time scale
+        short_features = self.short_term_processor(short_term)
+        medium_features = self.medium_term_processor(medium_term)
+        long_features = self.long_term_processor(long_term)
         
-        # Apply attention
-        attended_state = state_features * attention_weights
-        attended_reward = reward_features * (1 - attention_weights)
+        # Combine features from different time scales
+        combined_reward_features = th.cat([short_features, medium_features, long_features], dim=1)
+        scale_weights = self.scale_weights(combined_reward_features)
+        
+        # Weighted combination of features
+        reward_features = (
+            short_features * scale_weights[:, 0:1] +
+            medium_features * scale_weights[:, 1:2] +
+            long_features * scale_weights[:, 2:3]
+        )
+        
+        # State-reward interaction
+        interaction_features = self.state_reward_interaction(
+            th.cat([state_features, reward_features], dim=1)
+        )
         
         # Combine features
         combined_features = self.conditioning(
-            th.cat([attended_state, attended_reward], dim=1)
+            th.cat([state_features, interaction_features], dim=1)
         )
         
         # Map to latent space
