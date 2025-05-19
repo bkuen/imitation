@@ -698,7 +698,7 @@ class MLPStateVAE(MLPVae):
 class MLPStateRewardCVAE(MLPVae):
     """
     Enhanced Conditional VAE for encoding states based on rewards.
-    Uses attention mechanisms and residual connections for better reward conditioning.
+    Uses temporal reward structure and attention mechanisms for better conditioning.
     """
 
     def __init__(
@@ -721,9 +721,9 @@ class MLPStateRewardCVAE(MLPVae):
         self.encoder = self._create_encoder()
         self.decoder = self._create_decoder()
         
-        # Reward processing network
+        # Reward processing network - now takes 3x sequence_length (raw, diff, cumulative)
         self.reward_processor = nn.Sequential(
-            nn.Linear(sequence_length, hidden_dims[0]),
+            nn.Linear(sequence_length * 3, hidden_dims[0]),
             nn.LayerNorm(hidden_dims[0]),
             nn.ReLU(),
             nn.Linear(hidden_dims[0], hidden_dims[-1]),
@@ -745,6 +745,33 @@ class MLPStateRewardCVAE(MLPVae):
             nn.LayerNorm(hidden_dims[-1]),
             nn.ReLU()
         )
+
+    def _process_rewards(self, rewards: th.Tensor) -> th.Tensor:
+        """Process rewards to include temporal information
+        
+        Args:
+            rewards: Tensor of shape (batch_size, sequence_length)
+            
+        Returns:
+            Tensor of shape (batch_size, sequence_length * 3) containing:
+            - Raw rewards
+            - Reward differences
+            - Cumulative rewards
+        """
+        # Compute reward differences
+        reward_diffs = th.zeros_like(rewards)
+        reward_diffs[:, 1:] = rewards[:, 1:] - rewards[:, :-1]
+        
+        # Compute cumulative rewards
+        cum_rewards = th.cumsum(rewards, dim=1)
+        
+        # Normalize each component
+        rewards_norm = (rewards - rewards.mean(dim=1, keepdim=True)) / (rewards.std(dim=1, keepdim=True) + 1e-8)
+        reward_diffs_norm = (reward_diffs - reward_diffs.mean(dim=1, keepdim=True)) / (reward_diffs.std(dim=1, keepdim=True) + 1e-8)
+        cum_rewards_norm = (cum_rewards - cum_rewards.mean(dim=1, keepdim=True)) / (cum_rewards.std(dim=1, keepdim=True) + 1e-8)
+        
+        # Concatenate all reward information
+        return th.cat([rewards_norm, reward_diffs_norm, cum_rewards_norm], dim=1)
 
     def _create_encoder(self):
         encoder_layers = []
@@ -807,8 +834,9 @@ class MLPStateRewardCVAE(MLPVae):
         # Encode states
         state_features = self.encoder(x_flat)
         
-        # Process rewards
-        reward_features = self.reward_processor(rewards)
+        # Process rewards with temporal information
+        processed_rewards = self._process_rewards(rewards)
+        reward_features = self.reward_processor(processed_rewards)
         
         # Compute attention weights
         combined = th.cat([state_features, reward_features], dim=1)
@@ -818,7 +846,7 @@ class MLPStateRewardCVAE(MLPVae):
         attended_state = state_features * attention_weights
         attended_reward = reward_features * (1 - attention_weights)
         
-        # Combine features with residual connection
+        # Combine features
         combined_features = self.conditioning(
             th.cat([attended_state, attended_reward], dim=1)
         )
