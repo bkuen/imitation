@@ -697,8 +697,8 @@ class MLPStateVAE(MLPVae):
 
 class MLPStateRewardCVAE(MLPVae):
     """
-    Conditional VAE for encoding states based on rewards.
-    This model takes both state sequences and their corresponding reward sequences as input.
+    Enhanced Conditional VAE for encoding states based on rewards.
+    Uses attention mechanisms and residual connections for better reward conditioning.
     """
 
     def __init__(
@@ -721,33 +721,60 @@ class MLPStateRewardCVAE(MLPVae):
         self.encoder = self._create_encoder()
         self.decoder = self._create_decoder()
         
-        # Reward conditioning layers
-        self.reward_conditioning = nn.Sequential(
+        # Reward processing network
+        self.reward_processor = nn.Sequential(
             nn.Linear(sequence_length, hidden_dims[0]),
+            nn.LayerNorm(hidden_dims[0]),
             nn.ReLU(),
             nn.Linear(hidden_dims[0], hidden_dims[-1]),
-            nn.Sigmoid()  # Use sigmoid to create a gating mechanism
+            nn.LayerNorm(hidden_dims[-1]),
+            nn.ReLU()
+        )
+        
+        # Attention mechanism for reward-state interaction
+        self.attention = nn.Sequential(
+            nn.Linear(hidden_dims[-1] * 2, hidden_dims[-1]),
+            nn.Tanh(),
+            nn.Linear(hidden_dims[-1], 1),
+            nn.Sigmoid()
+        )
+        
+        # Final conditioning layer
+        self.conditioning = nn.Sequential(
+            nn.Linear(hidden_dims[-1] * 2, hidden_dims[-1]),
+            nn.LayerNorm(hidden_dims[-1]),
+            nn.ReLU()
         )
 
     def _create_encoder(self):
         encoder_layers = []
         in_dim = self.flat_dim
-        for hidden_dim in self.hidden_dims:
-            encoder_layers.extend([
-                nn.Linear(in_dim, hidden_dim),
-                nn.ReLU(),
-            ])
+        for i, hidden_dim in enumerate(self.hidden_dims):
+            # Add residual connection if dimensions match
+            if i > 0 and in_dim == hidden_dim:
+                encoder_layers.append(ResidualBlock(in_dim))
+            else:
+                encoder_layers.extend([
+                    nn.Linear(in_dim, hidden_dim),
+                    nn.LayerNorm(hidden_dim),
+                    nn.ReLU()
+                ])
             in_dim = hidden_dim
         return nn.Sequential(*encoder_layers)
     
     def _create_decoder(self):
         decoder_layers = []
         in_dim = self.latent_dim
-        for hidden_dim in reversed(self.hidden_dims):
-            decoder_layers.extend([
-                nn.Linear(in_dim, hidden_dim),
-                nn.ReLU(),
-            ])
+        for i, hidden_dim in enumerate(reversed(self.hidden_dims)):
+            # Add residual connection if dimensions match
+            if i > 0 and in_dim == hidden_dim:
+                decoder_layers.append(ResidualBlock(in_dim))
+            else:
+                decoder_layers.extend([
+                    nn.Linear(in_dim, hidden_dim),
+                    nn.LayerNorm(hidden_dim),
+                    nn.ReLU()
+                ])
             in_dim = hidden_dim
         decoder_layers.extend([
             nn.Linear(in_dim, self.flat_dim),
@@ -780,15 +807,25 @@ class MLPStateRewardCVAE(MLPVae):
         # Encode states
         state_features = self.encoder(x_flat)
         
-        # Create reward conditioning
-        reward_features = self.reward_conditioning(rewards)
+        # Process rewards
+        reward_features = self.reward_processor(rewards)
         
-        # Apply reward conditioning to state features
-        conditioned_features = state_features * reward_features
+        # Compute attention weights
+        combined = th.cat([state_features, reward_features], dim=1)
+        attention_weights = self.attention(combined)
+        
+        # Apply attention
+        attended_state = state_features * attention_weights
+        attended_reward = reward_features * (1 - attention_weights)
+        
+        # Combine features with residual connection
+        combined_features = self.conditioning(
+            th.cat([attended_state, attended_reward], dim=1)
+        )
         
         # Map to latent space
-        mu = self.fc_mu(conditioned_features)
-        logvar = self.fc_logvar(conditioned_features)
+        mu = self.fc_mu(combined_features)
+        logvar = self.fc_logvar(combined_features)
         
         z = self.reparameterize(mu, logvar)
         
@@ -826,6 +863,22 @@ class MLPStateRewardCVAE(MLPVae):
         x_reconstructed = self.decode(z, rewards)
         
         return x_reconstructed, mu, logvar
+
+class ResidualBlock(nn.Module):
+    """Residual block for the encoder and decoder"""
+    
+    def __init__(self, dim: int):
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.Linear(dim, dim),
+            nn.LayerNorm(dim),
+            nn.ReLU(),
+            nn.Linear(dim, dim),
+            nn.LayerNorm(dim)
+        )
+        
+    def forward(self, x: th.Tensor) -> th.Tensor:
+        return F.relu(x + self.block(x))
 
 class VAETrainer:
     """Trainer for the VAE"""
@@ -1137,7 +1190,7 @@ class VAETrainer:
         # Reconstruction loss
         recon_loss = F.mse_loss(x_reconstructed, x, reduction=reduction)
 
-        # KL divergence
+        # KL divergence with annealing
         kl_loss = -0.5 * th.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=1)
         if reduction == "mean":
             kl_loss = kl_loss.mean()
