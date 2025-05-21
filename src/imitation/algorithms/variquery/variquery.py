@@ -697,8 +697,8 @@ class MLPStateVAE(MLPVae):
 
 class MLPStateRewardCVAE(MLPVae):
     """
-    Enhanced Conditional VAE for encoding states based on rewards.
-    Uses attention mechanisms and residual connections for better reward conditioning.
+    Conditional VAE for encoding states based on rewards.
+    Uses a simpler direct conditioning approach without attention.
     """
 
     def __init__(
@@ -721,7 +721,7 @@ class MLPStateRewardCVAE(MLPVae):
         self.encoder = self._create_encoder()
         self.decoder = self._create_decoder()
         
-        # Reward processing network
+        # Simple reward processing network
         self.reward_processor = nn.Sequential(
             nn.Linear(sequence_length, hidden_dims[0]),
             nn.LayerNorm(hidden_dims[0]),
@@ -731,15 +731,7 @@ class MLPStateRewardCVAE(MLPVae):
             nn.ReLU()
         )
         
-        # Attention mechanism for reward-state interaction
-        self.attention = nn.Sequential(
-            nn.Linear(hidden_dims[-1] * 2, hidden_dims[-1]),
-            nn.Tanh(),
-            nn.Linear(hidden_dims[-1], 1),
-            nn.Sigmoid()
-        )
-        
-        # Final conditioning layer
+        # Direct conditioning layer
         self.conditioning = nn.Sequential(
             nn.Linear(hidden_dims[-1] * 2, hidden_dims[-1]),
             nn.LayerNorm(hidden_dims[-1]),
@@ -810,17 +802,9 @@ class MLPStateRewardCVAE(MLPVae):
         # Process rewards
         reward_features = self.reward_processor(rewards)
         
-        # Compute attention weights
-        combined = th.cat([state_features, reward_features], dim=1)
-        attention_weights = self.attention(combined)
-        
-        # Apply attention
-        attended_state = state_features * attention_weights
-        attended_reward = reward_features * (1 - attention_weights)
-        
-        # Combine features with residual connection
+        # Direct concatenation and conditioning
         combined_features = self.conditioning(
-            th.cat([attended_state, attended_reward], dim=1)
+            th.cat([state_features, reward_features], dim=1)
         )
         
         # Map to latent space
