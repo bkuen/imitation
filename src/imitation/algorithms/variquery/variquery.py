@@ -26,6 +26,7 @@ from typing import (
 import numpy as np
 import torch as th
 import torch.nn.functional as F
+import math
 
 class StateSegmentDataset(data_th.Dataset):
     """Dataset for the VARIQuery algorithm that handles pre-made fragments"""
@@ -695,10 +696,94 @@ class MLPStateVAE(MLPVae):
 
         return x_reconstructed, mu, logvar
 
+class MultiHeadAttention(nn.Module):
+    """Multi-head attention module for reward conditioning."""
+    
+    def __init__(self, dim: int, num_heads: int = 4):
+        super().__init__()
+        assert dim % num_heads == 0, "dim must be divisible by num_heads"
+        
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        
+        # Projections for query, key, value
+        self.q_proj = nn.Linear(dim, dim)
+        self.k_proj = nn.Linear(dim, dim)
+        self.v_proj = nn.Linear(dim, dim)
+        
+        # Output projection
+        self.out_proj = nn.Linear(dim, dim)
+        
+        # Layer normalization
+        self.norm = nn.LayerNorm(dim)
+        
+    def forward(self, x: th.Tensor, context: th.Tensor) -> th.Tensor:
+        """Forward pass through multi-head attention.
+        
+        Args:
+            x: Query tensor of shape (batch_size, dim)
+            context: Context tensor of shape (batch_size, dim)
+            
+        Returns:
+            Attended features of shape (batch_size, dim)
+        """
+        batch_size = x.shape[0]
+        
+        # Project inputs
+        q = self.q_proj(x).view(batch_size, self.num_heads, self.head_dim)
+        k = self.k_proj(context).view(batch_size, self.num_heads, self.head_dim)
+        v = self.v_proj(context).view(batch_size, self.num_heads, self.head_dim)
+        
+        # Compute attention scores
+        scores = th.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
+        attn_weights = F.softmax(scores, dim=-1)
+        
+        # Apply attention
+        out = th.matmul(attn_weights, v)
+        out = out.view(batch_size, -1)
+        
+        # Project and normalize
+        out = self.out_proj(out)
+        out = self.norm(out)
+        
+        return out
+
+class FiLMLayer(nn.Module):
+    """Feature-wise Linear Modulation (FiLM) layer for reward conditioning."""
+    
+    def __init__(self, dim: int):
+        super().__init__()
+        self.gamma_net = nn.Sequential(
+            nn.Linear(dim, dim),
+            nn.LayerNorm(dim),
+            nn.ReLU(),
+            nn.Linear(dim, dim)
+        )
+        self.beta_net = nn.Sequential(
+            nn.Linear(dim, dim),
+            nn.LayerNorm(dim),
+            nn.ReLU(),
+            nn.Linear(dim, dim)
+        )
+        
+    def forward(self, x: th.Tensor, condition: th.Tensor) -> th.Tensor:
+        """Apply FiLM conditioning.
+        
+        Args:
+            x: Input features of shape (batch_size, dim)
+            condition: Conditioning features of shape (batch_size, dim)
+            
+        Returns:
+            Modulated features of shape (batch_size, dim)
+        """
+        gamma = self.gamma_net(condition)
+        beta = self.beta_net(condition)
+        return gamma * x + beta
+
 class MLPStateRewardCVAE(MLPVae):
     """
     Conditional VAE for encoding states based on rewards.
-    Uses a simpler direct conditioning approach without attention.
+    Uses attention-based reward conditioning and FiLM layers for feature modulation.
     """
 
     def __init__(
@@ -707,6 +792,7 @@ class MLPStateRewardCVAE(MLPVae):
         sequence_length: int,
         latent_dim: int,
         hidden_dims: List[int] = [128, 64, 32],
+        num_attention_heads: int = 4,
         custom_logger: Optional[imit_logger.HierarchicalLogger] = None,
     ):
         super().__init__(
@@ -721,7 +807,7 @@ class MLPStateRewardCVAE(MLPVae):
         self.encoder = self._create_encoder()
         self.decoder = self._create_decoder()
         
-        # Simple reward processing network
+        # Enhanced reward processing network with temporal attention
         self.reward_processor = nn.Sequential(
             nn.Linear(sequence_length, hidden_dims[0]),
             nn.LayerNorm(hidden_dims[0]),
@@ -731,9 +817,18 @@ class MLPStateRewardCVAE(MLPVae):
             nn.ReLU()
         )
         
-        # Direct conditioning layer
+        # Multi-head attention for reward conditioning
+        self.attention = MultiHeadAttention(
+            dim=hidden_dims[-1],
+            num_heads=num_attention_heads
+        )
+        
+        # FiLM layer for feature modulation
+        self.film = FiLMLayer(hidden_dims[-1])
+        
+        # Final conditioning layer
         self.conditioning = nn.Sequential(
-            nn.Linear(hidden_dims[-1] * 2, hidden_dims[-1]),
+            nn.Linear(hidden_dims[-1], hidden_dims[-1]),
             nn.LayerNorm(hidden_dims[-1]),
             nn.ReLU()
         )
@@ -802,10 +897,14 @@ class MLPStateRewardCVAE(MLPVae):
         # Process rewards
         reward_features = self.reward_processor(rewards)
         
-        # Direct concatenation and conditioning
-        combined_features = self.conditioning(
-            th.cat([state_features, reward_features], dim=1)
-        )
+        # Apply attention-based conditioning
+        attended_features = self.attention(state_features, reward_features)
+        
+        # Apply FiLM conditioning
+        modulated_features = self.film(attended_features, reward_features)
+        
+        # Final conditioning
+        combined_features = self.conditioning(modulated_features)
         
         # Map to latent space
         mu = self.fc_mu(combined_features)
@@ -825,8 +924,14 @@ class MLPStateRewardCVAE(MLPVae):
         Returns:
             Tensor of shape (batch_size, sequence_length, state_dim)
         """
+        # Process rewards for decoder conditioning
+        reward_features = self.reward_processor(rewards)
+        
+        # Apply FiLM conditioning to latent code
+        modulated_z = self.film(z, reward_features)
+        
         # Decode to flattened state segments
-        x_flat = self.decoder(z)
+        x_flat = self.decoder(modulated_z)
         
         # Reshape to (batch_size, sequence_length, state_dim)
         x = x_flat.view(-1, self.sequence_length, self.state_dim)
