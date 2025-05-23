@@ -65,9 +65,10 @@ def train_defaults():
     vae_kl_weight = 1.0
     vae_batch_size = 32
     vae_epochs = 10
-    vae_early_stopping_patience = None,
+    vae_early_stopping_patience = None
     vae_mode = "state"
     vae_attention_heads = 4
+    vae_dropout = 0.0
     uncertainty_on = "logit"
     uncertainty_consensual_filtering = False
     fragmenter_kwargs = {

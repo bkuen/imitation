@@ -273,6 +273,7 @@ class VARIQueryFragmenter(Fragmenter):
         vae_kl_weight: float = 1.0,
         vae_early_stopping_patience: Optional[int] = None,
         vae_attention_heads: int = 4,
+        vae_dropout: float = 0.0,
         fragment_sample_factor: float = 2.0,
         device: str = "cuda" if th.cuda.is_available() else "cpu",
         visualization_interval: int = 10,
@@ -321,6 +322,7 @@ class VARIQueryFragmenter(Fragmenter):
                 latent_dim=vae_latent_dim,
                 hidden_dims=vae_hidden_dims,
                 num_attention_heads=vae_attention_heads,
+                dropout=vae_dropout,
                 custom_logger=self.logger,
             )
         else:
@@ -837,7 +839,7 @@ class MLPStateRewardCVAE(MLPVae):
         latent_dim: int,
         hidden_dims: List[int] = [128, 64, 32],
         num_attention_heads: int = 4,
-        dropout: float = 0.1,
+        dropout: float = 0.0,
         custom_logger: Optional[imit_logger.HierarchicalLogger] = None,
     ):
         super().__init__(
@@ -865,8 +867,8 @@ class MLPStateRewardCVAE(MLPVae):
         # Reward summary network for decoder conditioning
         self.reward_summary_net = nn.Sequential(
             nn.Linear(sequence_length, hidden_dims[-1]),
+            nn.LayerNorm(hidden_dims[-1]),
             nn.ReLU(),
-            nn.LayerNorm(hidden_dims[-1])
         )
         
         # Multi-head attention for reward conditioning
