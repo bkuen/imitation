@@ -272,6 +272,7 @@ class VARIQueryFragmenter(Fragmenter):
         vae_lr: float = 1e-3,
         vae_kl_weight: float = 1.0,
         vae_early_stopping_patience: Optional[int] = None,
+        vae_attention_heads: int = 4,
         fragment_sample_factor: float = 2.0,
         device: str = "cuda" if th.cuda.is_available() else "cpu",
         visualization_interval: int = 10,
@@ -319,6 +320,7 @@ class VARIQueryFragmenter(Fragmenter):
                 sequence_length=sequence_length,
                 latent_dim=vae_latent_dim,
                 hidden_dims=vae_hidden_dims,
+                num_attention_heads=vae_attention_heads,
                 custom_logger=self.logger,
             )
         else:

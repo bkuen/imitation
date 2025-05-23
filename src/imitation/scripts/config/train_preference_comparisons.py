@@ -67,6 +67,7 @@ def train_defaults():
     vae_epochs = 10
     vae_early_stopping_patience = None,
     vae_mode = "state"
+    vae_attention_heads = 4
     uncertainty_on = "logit"
     uncertainty_consensual_filtering = False
     fragmenter_kwargs = {
