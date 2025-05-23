@@ -749,26 +749,36 @@ class MultiHeadAttention(nn.Module):
         
         Args:
             x: Query tensor of shape (batch_size, dim) - state features
-            context: Context tensor of shape (batch_size, dim) - reward features
+            context: Context tensor of shape (batch_size, seq_len, dim) - reward features
             
         Returns:
             Attended features of shape (batch_size, dim)
         """
-        batch_size = x.shape[0]
+        B, T, D = context.shape
+        H, Hd = self.num_heads, self.head_dim
         
-        # Project inputs
-        q = self.q_proj(x).view(batch_size, self.num_heads, self.head_dim)  # (B, H, D/H)
-        k = self.k_proj(context).view(batch_size, self.num_heads, self.head_dim)  # (B, H, D/H)
-        v = self.v_proj(context).view(batch_size, self.num_heads, self.head_dim)  # (B, H, D/H)
+        # Project and reshape query
+        q = self.q_proj(x)  # (B, D)
+        q = q.view(B, H, 1, Hd)  # (B, H, 1, Hd)
+        
+        # Project and reshape key and value
+        k = self.k_proj(context)  # (B, T, D)
+        k = k.view(B, T, H, Hd).transpose(1, 2)  # (B, H, T, Hd)
+        
+        v = self.v_proj(context)  # (B, T, D)
+        v = v.view(B, T, H, Hd).transpose(1, 2)  # (B, H, T, Hd)
         
         # Compute attention scores
-        scores = th.matmul(q, k.transpose(-2, -1)) * self.scale  # (B, H, 1)
+        scores = th.matmul(q, k.transpose(-2, -1)) * self.scale  # (B, H, 1, T)
         attn_weights = F.softmax(scores, dim=-1)
         attn_weights = self.dropout(attn_weights)
         
         # Apply attention
-        out = th.matmul(attn_weights, v)  # (B, H, D/H)
-        out = out.transpose(1, 2).contiguous().view(batch_size, -1)  # (B, D)
+        out = th.matmul(attn_weights, v)  # (B, H, 1, Hd)
+        out = out.squeeze(2)  # (B, H, Hd)
+        
+        # Merge heads
+        out = out.transpose(1, 2).contiguous().view(B, D)  # (B, D)
         
         # Project and normalize
         out = self.out_proj(out)
@@ -842,14 +852,21 @@ class MLPStateRewardCVAE(MLPVae):
         self.encoder = self._create_encoder()
         self.decoder = self._create_decoder()
         
-        # Enhanced reward processing network
-        self.reward_processor = nn.Sequential(
-            nn.Linear(sequence_length, hidden_dims[0]),
+        # Reward encoder for temporal embeddings
+        self.reward_encoder = nn.Sequential(
+            nn.Linear(1, hidden_dims[0]),
             nn.LayerNorm(hidden_dims[0]),
             nn.ReLU(),
             nn.Linear(hidden_dims[0], hidden_dims[-1]),
             nn.LayerNorm(hidden_dims[-1]),
             nn.ReLU()
+        )
+        
+        # Reward summary network for decoder conditioning
+        self.reward_summary_net = nn.Sequential(
+            nn.Linear(sequence_length, hidden_dims[-1]),
+            nn.ReLU(),
+            nn.LayerNorm(hidden_dims[-1])
         )
         
         # Multi-head attention for reward conditioning
@@ -929,8 +946,10 @@ class MLPStateRewardCVAE(MLPVae):
         Returns:
             Tuple of (mu, logvar, z) each of shape (batch_size, latent_dim)
         """
+        B = x.shape[0]
+        
         # Flatten input: (batch, seq_len, state_dim)
-        x_flat = x.view(x.shape[0], -1)
+        x_flat = x.view(B, -1)
         
         # Ensure rewards are properly shaped
         if rewards.dim() == 1:
@@ -943,19 +962,23 @@ class MLPStateRewardCVAE(MLPVae):
                 rewards = th.cat([rewards, padding], dim=1)
 
         # Encode states
-        state_features = self.encoder(x_flat)
+        state_features = self.encoder(x_flat)  # (B, D)
         
-        # Process rewards into a single vector per batch
-        reward_features = self.reward_processor(rewards)
+        # Process rewards into temporal embeddings
+        r = rewards.unsqueeze(-1)  # (B, T, 1)
+        reward_seq_emb = self.reward_encoder(r)  # (B, T, D)
+        
+        # Create reward summary for FiLM conditioning
+        reward_summary = reward_seq_emb.mean(dim=1)  # (B, D)
         
         # Apply attention-based conditioning
-        attended_features = self.attention(state_features, reward_features)
+        attended_features = self.attention(state_features, reward_seq_emb)  # (B, D)
         
-        # Apply FiLM conditioning
-        modulated_features = self.film(attended_features, reward_features)
+        # Apply FiLM conditioning using reward summary
+        modulated_features = self.film(attended_features, reward_summary)  # (B, D)
         
         # Final conditioning
-        combined_features = self.conditioning(modulated_features)
+        combined_features = self.conditioning(modulated_features)  # (B, D)
         
         # Map to latent space
         mu = self.fc_mu(combined_features)
@@ -975,17 +998,19 @@ class MLPStateRewardCVAE(MLPVae):
         Returns:
             Tensor of shape (batch_size, sequence_length, state_dim)
         """
-        # Process rewards for decoder conditioning
-        reward_features = self.reward_processor(rewards)
+        B = z.shape[0]
+        
+        # Process rewards into summary vector for decoder conditioning
+        reward_summary = self.reward_summary_net(rewards)  # (B, D)
         
         # Apply FiLM conditioning to latent code
-        modulated_z = self.film(z, reward_features)
+        modulated_z = self.film(z, reward_summary)  # (B, D)
         
         # Decode to flattened state segments
-        x_flat = self.decoder(modulated_z)
+        x_flat = self.decoder(modulated_z)  # (B, T*state_dim)
         
         # Reshape to (batch_size, sequence_length, state_dim)
-        x = x_flat.view(-1, self.sequence_length, self.state_dim)
+        x = x_flat.view(B, self.sequence_length, self.state_dim)
         
         return x
     
