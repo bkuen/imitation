@@ -699,14 +699,19 @@ class MLPStateVAE(MLPVae):
         return x_reconstructed, mu, logvar
 
 class MultiHeadAttention(nn.Module):
-    """Multi-head attention module for reward conditioning."""
+    """Multi-head attention module for temporal reward conditioning.
     
-    def __init__(self, dim: int, num_heads: int = 4):
+    This module allows state features to attend over temporal reward features,
+    learning which reward patterns are most relevant for each state.
+    """
+    
+    def __init__(self, dim: int, num_heads: int = 4, dropout: float = 0.1):
         super().__init__()
         assert dim % num_heads == 0, "dim must be divisible by num_heads"
         
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
+        self.scale = self.head_dim ** -0.5
         
         # Projections for query, key, value
         self.q_proj = nn.Linear(dim, dim)
@@ -719,12 +724,32 @@ class MultiHeadAttention(nn.Module):
         # Layer normalization
         self.norm = nn.LayerNorm(dim)
         
+        # Dropout for regularization
+        self.dropout = nn.Dropout(dropout)
+        
+        # Initialize weights
+        self._init_weights()
+        
+    def _init_weights(self):
+        """Initialize weights with proper scaling."""
+        # Initialize projections
+        nn.init.xavier_uniform_(self.q_proj.weight, gain=0.02)
+        nn.init.xavier_uniform_(self.k_proj.weight, gain=0.02)
+        nn.init.xavier_uniform_(self.v_proj.weight, gain=0.02)
+        nn.init.xavier_uniform_(self.out_proj.weight, gain=0.02)
+        
+        # Initialize biases to zero
+        nn.init.zeros_(self.q_proj.bias)
+        nn.init.zeros_(self.k_proj.bias)
+        nn.init.zeros_(self.v_proj.bias)
+        nn.init.zeros_(self.out_proj.bias)
+        
     def forward(self, x: th.Tensor, context: th.Tensor) -> th.Tensor:
         """Forward pass through multi-head attention.
         
         Args:
-            x: Query tensor of shape (batch_size, dim)
-            context: Context tensor of shape (batch_size, dim)
+            x: Query tensor of shape (batch_size, dim) - state features
+            context: Context tensor of shape (batch_size, dim) - reward features
             
         Returns:
             Attended features of shape (batch_size, dim)
@@ -732,17 +757,18 @@ class MultiHeadAttention(nn.Module):
         batch_size = x.shape[0]
         
         # Project inputs
-        q = self.q_proj(x).view(batch_size, self.num_heads, self.head_dim)
-        k = self.k_proj(context).view(batch_size, self.num_heads, self.head_dim)
-        v = self.v_proj(context).view(batch_size, self.num_heads, self.head_dim)
+        q = self.q_proj(x).view(batch_size, self.num_heads, self.head_dim)  # (B, H, D/H)
+        k = self.k_proj(context).view(batch_size, self.num_heads, self.head_dim)  # (B, H, D/H)
+        v = self.v_proj(context).view(batch_size, self.num_heads, self.head_dim)  # (B, H, D/H)
         
         # Compute attention scores
-        scores = th.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
+        scores = th.matmul(q, k.transpose(-2, -1)) * self.scale  # (B, H, 1)
         attn_weights = F.softmax(scores, dim=-1)
+        attn_weights = self.dropout(attn_weights)
         
         # Apply attention
-        out = th.matmul(attn_weights, v)
-        out = out.view(batch_size, -1)
+        out = th.matmul(attn_weights, v)  # (B, H, D/H)
+        out = out.transpose(1, 2).contiguous().view(batch_size, -1)  # (B, D)
         
         # Project and normalize
         out = self.out_proj(out)
@@ -767,6 +793,12 @@ class FiLMLayer(nn.Module):
             nn.ReLU(),
             nn.Linear(dim, dim)
         )
+        
+        # Initialize final layers to produce identity transformation
+        nn.init.zeros_(self.gamma_net[-1].weight)
+        nn.init.ones_(self.gamma_net[-1].bias)  # Initialize to 1 for identity scaling
+        nn.init.zeros_(self.beta_net[-1].weight)
+        nn.init.zeros_(self.beta_net[-1].bias)  # Initialize to 0 for identity shift
         
     def forward(self, x: th.Tensor, condition: th.Tensor) -> th.Tensor:
         """Apply FiLM conditioning.
@@ -795,6 +827,7 @@ class MLPStateRewardCVAE(MLPVae):
         latent_dim: int,
         hidden_dims: List[int] = [128, 64, 32],
         num_attention_heads: int = 4,
+        dropout: float = 0.1,
         custom_logger: Optional[imit_logger.HierarchicalLogger] = None,
     ):
         super().__init__(
@@ -809,7 +842,7 @@ class MLPStateRewardCVAE(MLPVae):
         self.encoder = self._create_encoder()
         self.decoder = self._create_decoder()
         
-        # Enhanced reward processing network with temporal attention
+        # Enhanced reward processing network
         self.reward_processor = nn.Sequential(
             nn.Linear(sequence_length, hidden_dims[0]),
             nn.LayerNorm(hidden_dims[0]),
@@ -822,7 +855,8 @@ class MLPStateRewardCVAE(MLPVae):
         # Multi-head attention for reward conditioning
         self.attention = MultiHeadAttention(
             dim=hidden_dims[-1],
-            num_heads=num_attention_heads
+            num_heads=num_attention_heads,
+            dropout=dropout
         )
         
         # FiLM layer for feature modulation
@@ -834,6 +868,21 @@ class MLPStateRewardCVAE(MLPVae):
             nn.LayerNorm(hidden_dims[-1]),
             nn.ReLU()
         )
+        
+        # Conditional prior network
+        self.prior_net = nn.Sequential(
+            nn.Linear(sequence_length, hidden_dims[0]),
+            nn.LayerNorm(hidden_dims[0]),
+            nn.ReLU(),
+            nn.Linear(hidden_dims[0], hidden_dims[-1]),
+            nn.LayerNorm(hidden_dims[-1]),
+            nn.ReLU(),
+            nn.Linear(hidden_dims[-1], 2 * latent_dim)  # Outputs μ and logσ²
+        )
+        
+        # Initialize prior network to produce standard normal
+        nn.init.zeros_(self.prior_net[-1].weight)
+        nn.init.zeros_(self.prior_net[-1].bias)
 
     def _create_encoder(self):
         encoder_layers = []
@@ -896,7 +945,7 @@ class MLPStateRewardCVAE(MLPVae):
         # Encode states
         state_features = self.encoder(x_flat)
         
-        # Process rewards
+        # Process rewards into a single vector per batch
         reward_features = self.reward_processor(rewards)
         
         # Apply attention-based conditioning
@@ -940,7 +989,21 @@ class MLPStateRewardCVAE(MLPVae):
         
         return x
     
-    def forward(self, x: th.Tensor, rewards: th.Tensor) -> Tuple[th.Tensor, th.Tensor, th.Tensor]:
+    def get_prior(self, rewards: th.Tensor) -> Tuple[th.Tensor, th.Tensor]:
+        """Get the conditional prior distribution parameters.
+        
+        Args:
+            rewards: Tensor of shape (batch_size, sequence_length)
+            
+        Returns:
+            Tuple of (mu_prior, logvar_prior) each of shape (batch_size, latent_dim)
+        """
+        # Get prior parameters from reward sequence
+        prior_params = self.prior_net(rewards)
+        mu_prior, logvar_prior = prior_params.chunk(2, dim=1)
+        return mu_prior, logvar_prior
+    
+    def forward(self, x: th.Tensor, rewards: th.Tensor) -> Tuple[th.Tensor, th.Tensor, th.Tensor, th.Tensor, th.Tensor]:
         """Forward pass through CVAE
         
         Args:
@@ -948,12 +1011,18 @@ class MLPStateRewardCVAE(MLPVae):
             rewards: Tensor of shape (batch_size, sequence_length) reward sequence
             
         Returns:
-            Tuple of (x_reconstructed, mu, logvar)
+            Tuple of (x_reconstructed, mu, logvar, mu_prior, logvar_prior)
         """
+        # Get posterior parameters
         mu, logvar, z = self.encode(x, rewards)
+        
+        # Get prior parameters
+        mu_prior, logvar_prior = self.get_prior(rewards)
+        
+        # Decode
         x_reconstructed = self.decode(z, rewards)
         
-        return x_reconstructed, mu, logvar
+        return x_reconstructed, mu, logvar, mu_prior, logvar_prior
 
 class ResidualBlock(nn.Module):
     """Residual block for the encoder and decoder"""
@@ -1146,11 +1215,13 @@ class VAETrainer:
                 x = x.to(self.device).float()  # Ensure float32
                 rewards = rewards.to(self.device).float()  # Ensure float32
                 # Forward pass
-                x_reconstructed, mu, logvar = self.vae(x, rewards)
+                x_reconstructed, mu, logvar, mu_prior, logvar_prior = self.vae(x, rewards)
             else:
                 x = batch.to(self.device).float()  # Ensure float32
                 # Forward pass
                 x_reconstructed, mu, logvar = self.vae(x)
+                mu_prior = th.zeros_like(mu)
+                logvar_prior = th.zeros_like(logvar)
 
             # Compute loss
             loss, recon_loss, kl_loss = self._vae_loss(
@@ -1158,6 +1229,8 @@ class VAETrainer:
                 mu=mu,
                 logvar=logvar,
                 x_reconstructed=x_reconstructed,
+                mu_prior=mu_prior,
+                logvar_prior=logvar_prior,
                 kl_weight_beta=self.kl_weight_beta,
                 reduction="mean",
             )
@@ -1222,11 +1295,13 @@ class VAETrainer:
                 x = x.to(self.device).float()  # Ensure float32
                 rewards = rewards.to(self.device).float()  # Ensure float32
                 # Forward pass
-                x_reconstructed, mu, logvar = self.vae(x, rewards)
+                x_reconstructed, mu, logvar, mu_prior, logvar_prior = self.vae(x, rewards)
             else:
                 x = batch.to(self.device).float()  # Ensure float32
                 # Forward pass
                 x_reconstructed, mu, logvar = self.vae(x)
+                mu_prior = th.zeros_like(mu)
+                logvar_prior = th.zeros_like(logvar)
             
             # Compute loss
             loss, recon_loss, kl_loss = self._vae_loss(
@@ -1234,6 +1309,8 @@ class VAETrainer:
                 mu=mu,
                 logvar=logvar,
                 x_reconstructed=x_reconstructed,
+                mu_prior=mu_prior,
+                logvar_prior=logvar_prior,
                 kl_weight_beta=self.kl_weight_beta,
                 reduction="mean",
             )
@@ -1262,6 +1339,8 @@ class VAETrainer:
         mu: th.Tensor, 
         logvar: th.Tensor,
         x_reconstructed: th.Tensor,
+        mu_prior: th.Tensor,
+        logvar_prior: th.Tensor,
         kl_weight_beta: float = 1.0,
         reduction: str = "mean",
     ) -> Tuple[th.Tensor, th.Tensor, th.Tensor]:
@@ -1269,9 +1348,11 @@ class VAETrainer:
         
         Args:
             x: Tensor of shape (batch_size, sequence_length, state_dim)
-            mu: Tensor of shape (batch_size, latent_dim)
-            logvar: Tensor of shape (batch_size, latent_dim)
+            mu: Tensor of shape (batch_size, latent_dim) - posterior mean
+            logvar: Tensor of shape (batch_size, latent_dim) - posterior log variance
             x_reconstructed: Tensor of shape (batch_size, sequence_length, state_dim)
+            mu_prior: Tensor of shape (batch_size, latent_dim) - prior mean
+            logvar_prior: Tensor of shape (batch_size, latent_dim) - prior log variance
             kl_weight_beta: Weight for KL divergence (β-VAE parameter)
             reduction: Reduction method ("mean", "sum", "none")
 
@@ -1281,8 +1362,12 @@ class VAETrainer:
         # Reconstruction loss
         recon_loss = F.mse_loss(x_reconstructed, x, reduction=reduction)
 
-        # KL divergence with annealing
-        kl_loss = -0.5 * th.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=1)
+        # KL divergence between posterior and conditional prior
+        kl_loss = -0.5 * th.sum(
+            1 + (logvar - logvar_prior) 
+            - ((mu - mu_prior).pow(2) + logvar.exp()) / logvar_prior.exp(),
+            dim=1
+        )
         if reduction == "mean":
             kl_loss = kl_loss.mean()
         elif reduction == "sum":
