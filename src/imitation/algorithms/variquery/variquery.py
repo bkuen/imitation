@@ -277,7 +277,7 @@ class VARIQueryFragmenter(Fragmenter):
         fragment_sample_factor: float = 2.0,
         device: str = "cuda" if th.cuda.is_available() else "cpu",
         visualization_interval: int = 10,
-        vae_mode: str = "state",  # New parameter: "state" or "state_reward"
+        vae_mode: str = "state",  # "state", "state_reward", or "state_reward_concat"
     ):
         super().__init__(custom_logger)
         self.allow_variable_horizon = allow_variable_horizon
@@ -316,7 +316,7 @@ class VARIQueryFragmenter(Fragmenter):
                 custom_logger=self.logger,
             )
         elif vae_mode == "state_reward":
-            self.vae = MLPStateRewardCVAE(
+            self.vae = MLPStateRewardAttentionCVAE(
                 state_dim=state_dim,
                 sequence_length=sequence_length,
                 latent_dim=vae_latent_dim,
@@ -325,8 +325,17 @@ class VARIQueryFragmenter(Fragmenter):
                 dropout=vae_dropout,
                 custom_logger=self.logger,
             )
+        elif vae_mode == "state_reward_concat":
+            self.vae = MLPStateRewardConcatCVAE(
+                state_dim=state_dim,
+                sequence_length=sequence_length,
+                latent_dim=vae_latent_dim,
+                hidden_dims=vae_hidden_dims,
+                dropout=vae_dropout,
+                custom_logger=self.logger,
+            )
         else:
-            raise ValueError(f"Invalid VAE mode: {vae_mode}. Must be either 'state' or 'state_reward'")
+            raise ValueError(f"Invalid VAE mode: {vae_mode}. Must be either 'state', 'state_reward', or 'state_reward_concat'")
 
     def __call__(
         self,
@@ -707,7 +716,7 @@ class MultiHeadAttention(nn.Module):
     learning which reward patterns are most relevant for each state.
     """
     
-    def __init__(self, dim: int, num_heads: int = 4, dropout: float = 0.1):
+    def __init__(self, dim: int, num_heads: int = 4, dropout: float = 0.0):
         super().__init__()
         assert dim % num_heads == 0, "dim must be divisible by num_heads"
         
@@ -826,7 +835,7 @@ class FiLMLayer(nn.Module):
         beta = self.beta_net(condition)
         return gamma * x + beta
 
-class MLPStateRewardCVAE(MLPVae):
+class MLPStateRewardAttentionCVAE(MLPVae):
     """
     Conditional VAE for encoding states based on rewards.
     Uses attention-based reward conditioning and FiLM layers for feature modulation.
@@ -868,7 +877,7 @@ class MLPStateRewardCVAE(MLPVae):
         self.reward_summary_net = nn.Sequential(
             nn.Linear(sequence_length, hidden_dims[-1]),
             nn.LayerNorm(hidden_dims[-1]),
-            nn.ReLU(),
+            nn.ReLU()
         )
         
         # Multi-head attention for reward conditioning
@@ -1112,7 +1121,9 @@ class VAETrainer:
         )
         
         # Check if we're using a CVAE
-        self.is_cvae = isinstance(vae, MLPStateRewardCVAE)
+        self.is_attention_cvae = isinstance(vae, MLPStateRewardAttentionCVAE)
+        self.is_concat_cvae = isinstance(vae, MLPStateRewardConcatCVAE)
+        self.is_cvae = self.is_attention_cvae or self.is_concat_cvae
 
     def train(
         self,
@@ -1404,6 +1415,191 @@ class VAETrainer:
         loss = recon_loss + kl_weight_beta * kl_loss
 
         return loss, recon_loss, kl_loss
+
+class MLPStateRewardConcatCVAE(MLPVae):
+    """
+    Simple Conditional VAE that concatenates state and reward sequences.
+    Uses a basic concatenation approach for conditioning.
+    """
+
+    def __init__(
+        self,
+        state_dim: int,
+        sequence_length: int,
+        latent_dim: int,
+        hidden_dims: List[int] = [128, 64, 32],
+        dropout: float = 0.0,
+        custom_logger: Optional[imit_logger.HierarchicalLogger] = None,
+    ):
+        super().__init__(
+            state_dim=state_dim,
+            sequence_length=sequence_length,
+            latent_dim=latent_dim,
+            hidden_dims=hidden_dims,
+            custom_logger=custom_logger,
+        )
+
+        # Create encoder and decoder
+        self.encoder = self._create_encoder()
+        self.decoder = self._create_decoder()
+        
+        # Conditional prior network
+        self.prior_net = nn.Sequential(
+            nn.Linear(sequence_length, hidden_dims[0]),
+            nn.LayerNorm(hidden_dims[0]),
+            nn.ReLU(),
+            nn.Linear(hidden_dims[0], hidden_dims[-1]),
+            nn.LayerNorm(hidden_dims[-1]),
+            nn.ReLU(),
+            nn.Linear(hidden_dims[-1], 2 * latent_dim)  # Outputs μ and logσ²
+        )
+        
+        # Initialize prior network to produce standard normal
+        nn.init.zeros_(self.prior_net[-1].weight)
+        nn.init.zeros_(self.prior_net[-1].bias)
+
+    def _create_encoder(self):
+        encoder_layers = []
+        # Input dimension is state_dim * sequence_length + sequence_length (for rewards)
+        in_dim = self.flat_dim + self.sequence_length
+        for i, hidden_dim in enumerate(self.hidden_dims):
+            # Add residual connection if dimensions match
+            if i > 0 and in_dim == hidden_dim:
+                encoder_layers.append(ResidualBlock(in_dim))
+            else:
+                encoder_layers.extend([
+                    nn.Linear(in_dim, hidden_dim),
+                    nn.LayerNorm(hidden_dim),
+                    nn.ReLU()
+                ])
+            in_dim = hidden_dim
+        return nn.Sequential(*encoder_layers)
+    
+    def _create_decoder(self):
+        decoder_layers = []
+        in_dim = self.latent_dim + self.sequence_length  # Add reward sequence dimension
+        for i, hidden_dim in enumerate(reversed(self.hidden_dims)):
+            # Add residual connection if dimensions match
+            if i > 0 and in_dim == hidden_dim:
+                decoder_layers.append(ResidualBlock(in_dim))
+            else:
+                decoder_layers.extend([
+                    nn.Linear(in_dim, hidden_dim),
+                    nn.LayerNorm(hidden_dim),
+                    nn.ReLU()
+                ])
+            in_dim = hidden_dim
+        decoder_layers.extend([
+            nn.Linear(in_dim, self.flat_dim),
+        ])
+        return nn.Sequential(*decoder_layers)
+    
+    def encode(self, x: th.Tensor, rewards: th.Tensor) -> Tuple[th.Tensor, th.Tensor, th.Tensor]:
+        """Encode state segments into latent space conditioned on reward sequence
+        
+        Args:
+            x: (batch_size, fragment_length, state_dim)
+            rewards: (batch_size, fragment_length) reward sequence for each trajectory
+
+        Returns:
+            Tuple of (mu, logvar, z) each of shape (batch_size, latent_dim)
+        """
+        B = x.shape[0]
+        
+        # Flatten input: (batch, seq_len, state_dim)
+        x_flat = x.view(B, -1)
+        
+        # Ensure rewards are properly shaped
+        if rewards.dim() == 1:
+            rewards = rewards.unsqueeze(1)
+        if rewards.shape[1] != self.sequence_length:
+            if rewards.shape[1] > self.sequence_length:
+                rewards = rewards[:, :self.sequence_length]
+            else:
+                padding = th.zeros(rewards.shape[0], self.sequence_length - rewards.shape[1], device=rewards.device)
+                rewards = th.cat([rewards, padding], dim=1)
+        
+        # Concatenate state and reward features
+        combined = th.cat([x_flat, rewards], dim=1)
+        
+        # Encode
+        hidden = self.encoder(combined)
+        
+        # Map to latent space
+        mu = self.fc_mu(hidden)
+        logvar = self.fc_logvar(hidden)
+        
+        z = self.reparameterize(mu, logvar)
+        
+        return mu, logvar, z
+    
+    def decode(self, z: th.Tensor, rewards: th.Tensor) -> th.Tensor:
+        """Decode latent space samples into state segments
+        
+        Args:
+            z: Tensor of shape (batch_size, latent_dim)
+            rewards: Tensor of shape (batch_size, sequence_length) reward sequence
+
+        Returns:
+            Tensor of shape (batch_size, sequence_length, state_dim)
+        """
+        B = z.shape[0]
+        
+        # Ensure rewards are properly shaped
+        if rewards.dim() == 1:
+            rewards = rewards.unsqueeze(1)
+        if rewards.shape[1] != self.sequence_length:
+            if rewards.shape[1] > self.sequence_length:
+                rewards = rewards[:, :self.sequence_length]
+            else:
+                padding = th.zeros(rewards.shape[0], self.sequence_length - rewards.shape[1], device=rewards.device)
+                rewards = th.cat([rewards, padding], dim=1)
+        
+        # Concatenate latent code with rewards
+        combined = th.cat([z, rewards], dim=1)
+        
+        # Decode to flattened state segments
+        x_flat = self.decoder(combined)  # (B, T*state_dim)
+        
+        # Reshape to (batch_size, sequence_length, state_dim)
+        x = x_flat.view(B, self.sequence_length, self.state_dim)
+        
+        return x
+
+    def get_prior(self, rewards: th.Tensor) -> Tuple[th.Tensor, th.Tensor]:
+        """Get the conditional prior distribution parameters.
+        
+        Args:
+            rewards: Tensor of shape (batch_size, sequence_length)
+            
+        Returns:
+            Tuple of (mu_prior, logvar_prior) each of shape (batch_size, latent_dim)
+        """
+        # Get prior parameters from reward sequence
+        prior_params = self.prior_net(rewards)
+        mu_prior, logvar_prior = prior_params.chunk(2, dim=1)
+        return mu_prior, logvar_prior
+
+    def forward(self, x: th.Tensor, rewards: th.Tensor) -> Tuple[th.Tensor, th.Tensor, th.Tensor, th.Tensor, th.Tensor]:
+        """Forward pass through CVAE
+        
+        Args:
+            x: Tensor of shape (batch_size, sequence_length, state_dim)
+            rewards: Tensor of shape (batch_size, sequence_length) reward sequence
+            
+        Returns:
+            Tuple of (x_reconstructed, mu, logvar, mu_prior, logvar_prior)
+        """
+        # Get posterior parameters
+        mu, logvar, z = self.encode(x, rewards)
+        
+        # Get prior parameters
+        mu_prior, logvar_prior = self.get_prior(rewards)
+        
+        # Decode
+        x_reconstructed = self.decode(z, rewards)
+        
+        return x_reconstructed, mu, logvar, mu_prior, logvar_prior
 
         
     
