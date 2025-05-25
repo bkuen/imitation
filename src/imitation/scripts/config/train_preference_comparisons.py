@@ -63,6 +63,7 @@ def train_defaults():
     vae_hidden_dims = [128, 64, 32]
     vae_lr = 1e-3
     vae_kl_weight = 1.0
+    vae_kl_warmup_epochs = 0
     vae_batch_size = 32
     vae_epochs = 10
     vae_early_stopping_patience = None

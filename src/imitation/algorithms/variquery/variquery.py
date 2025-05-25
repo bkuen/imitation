@@ -271,6 +271,7 @@ class VARIQueryFragmenter(Fragmenter):
         vae_batch_size: int = 32,
         vae_lr: float = 1e-3,
         vae_kl_weight: float = 1.0,
+        vae_kl_warmup_epochs: int = 0,
         vae_early_stopping_patience: Optional[int] = None,
         vae_attention_heads: int = 4,
         vae_dropout: float = 0.0,
@@ -304,6 +305,7 @@ class VARIQueryFragmenter(Fragmenter):
         self.vae_lr = vae_lr
         self.vae_kl_weight = vae_kl_weight
         self.vae_early_stopping_patience = vae_early_stopping_patience
+        self.vae_kl_warmup_epochs = vae_kl_warmup_epochs
         self.device = device
         
         # Create appropriate VAE based on mode
@@ -550,6 +552,7 @@ class VARIQueryFragmenter(Fragmenter):
             device=self.device,
             lr=self.vae_lr,
             kl_weight_beta=self.vae_kl_weight,
+            kl_warmup_epochs=self.vae_kl_warmup_epochs,  # New parameter for KL warmup
             batch_size=self.vae_batch_size,
             early_stopping_patience=self.vae_early_stopping_patience,
             optimizer=th.optim.Adam(self.vae.parameters(), lr=self.vae_lr),
@@ -861,15 +864,23 @@ class MLPStateRewardAttentionCVAE(MLPVae):
 
         # Create encoder and decoder
         self.encoder = self._create_encoder()
-        self.decoder = self._create_decoder()
         
-        # Reward encoder for temporal embeddings
+        # Add positional embeddings
+        self.pos_emb = nn.Parameter(th.randn(sequence_length, hidden_dims[-1]))
+        
+        # Reward encoder using 1D CNN
         self.reward_encoder = nn.Sequential(
-            nn.Linear(1, hidden_dims[0]),
-            nn.LayerNorm(hidden_dims[0]),
+            # First conv layer: expand channels
+            nn.Conv1d(1, hidden_dims[0], kernel_size=3, padding=1),
+            nn.LayerNorm([hidden_dims[0], sequence_length]),
             nn.ReLU(),
-            nn.Linear(hidden_dims[0], hidden_dims[-1]),
-            nn.LayerNorm(hidden_dims[-1]),
+            # Second conv layer: maintain channels
+            nn.Conv1d(hidden_dims[0], hidden_dims[0], kernel_size=3, padding=1),
+            nn.LayerNorm([hidden_dims[0], sequence_length]),
+            nn.ReLU(),
+            # Final conv layer: reduce to target dimension
+            nn.Conv1d(hidden_dims[0], hidden_dims[-1], kernel_size=3, padding=1),
+            nn.LayerNorm([hidden_dims[-1], sequence_length]),
             nn.ReLU()
         )
         
@@ -896,6 +907,16 @@ class MLPStateRewardAttentionCVAE(MLPVae):
             nn.LayerNorm(hidden_dims[-1]),
             nn.ReLU()
         )
+        
+        # Decoder components
+        D = hidden_dims[-1]
+        H = num_attention_heads
+        # 1) Map z → decoder hidden dim
+        self.decoder_input = nn.Linear(latent_dim, D)
+        # 2) A cross-attention module
+        self.decoder_cross_attn = MultiHeadAttention(dim=D, num_heads=H, dropout=dropout)
+        # 3) Create decoder
+        self.decoder = self._create_decoder(input_dim=D)
         
         # Conditional prior network
         self.prior_net = nn.Sequential(
@@ -928,23 +949,25 @@ class MLPStateRewardAttentionCVAE(MLPVae):
             in_dim = hidden_dim
         return nn.Sequential(*encoder_layers)
     
-    def _create_decoder(self):
+    def _create_decoder(self, input_dim=None):
+        """Create decoder with specified input dimension
+        
+        Args:
+            input_dim: Input dimension for the decoder. If None, uses latent_dim.
+            
+        Returns:
+            Sequential decoder network
+        """
         decoder_layers = []
-        in_dim = self.latent_dim
-        for i, hidden_dim in enumerate(reversed(self.hidden_dims)):
-            # Add residual connection if dimensions match
-            if i > 0 and in_dim == hidden_dim:
-                decoder_layers.append(ResidualBlock(in_dim))
-            else:
-                decoder_layers.extend([
-                    nn.Linear(in_dim, hidden_dim),
-                    nn.LayerNorm(hidden_dim),
-                    nn.ReLU()
-                ])
+        in_dim = input_dim or self.latent_dim
+        for hidden_dim in reversed(self.hidden_dims):
+            decoder_layers.extend([
+                nn.Linear(in_dim, hidden_dim),
+                nn.LayerNorm(hidden_dim),
+                nn.ReLU(),
+            ])
             in_dim = hidden_dim
-        decoder_layers.extend([
-            nn.Linear(in_dim, self.flat_dim),
-        ])
+        decoder_layers.append(nn.Linear(in_dim, self.flat_dim))
         return nn.Sequential(*decoder_layers)
     
     def encode(self, x: th.Tensor, rewards: th.Tensor) -> Tuple[th.Tensor, th.Tensor, th.Tensor]:
@@ -971,19 +994,20 @@ class MLPStateRewardAttentionCVAE(MLPVae):
             else:
                 padding = th.zeros(rewards.shape[0], self.sequence_length - rewards.shape[1], device=rewards.device)
                 rewards = th.cat([rewards, padding], dim=1)
-
+        
         # Encode states
         state_features = self.encoder(x_flat)  # (B, D)
         
-        # Process rewards into temporal embeddings
-        r = rewards.unsqueeze(-1)  # (B, T, 1)
-        reward_seq_emb = self.reward_encoder(r)  # (B, T, D)
+        # Process rewards into temporal embeddings using CNN
+        r = rewards.unsqueeze(1)  # (B, 1, T)
+        r_emb = self.reward_encoder(r).transpose(1, 2)  # (B, T, D)
+        r_emb = r_emb + self.pos_emb  # (B, T, D)
         
         # Create reward summary for FiLM conditioning
-        reward_summary = reward_seq_emb.mean(dim=1)  # (B, D)
+        reward_summary = r_emb.mean(dim=1)  # (B, D)
         
         # Apply attention-based conditioning
-        attended_features = self.attention(state_features, reward_seq_emb)  # (B, D)
+        attended_features = self.attention(state_features, r_emb)  # (B, D)
         
         # Apply FiLM conditioning using reward summary
         modulated_features = self.film(attended_features, reward_summary)  # (B, D)
@@ -1000,7 +1024,7 @@ class MLPStateRewardAttentionCVAE(MLPVae):
         return mu, logvar, z
     
     def decode(self, z: th.Tensor, rewards: th.Tensor) -> th.Tensor:
-        """Decode latent space samples into state segments
+        """Decode latent space samples into state segments with cross-attention
         
         Args:
             z: Tensor of shape (batch_size, latent_dim)
@@ -1009,21 +1033,27 @@ class MLPStateRewardAttentionCVAE(MLPVae):
         Returns:
             Tensor of shape (batch_size, sequence_length, state_dim)
         """
-        B = z.shape[0]
-        
-        # Process rewards into summary vector for decoder conditioning
-        reward_summary = self.reward_summary_net(rewards)  # (B, D)
-        
-        # Apply FiLM conditioning to latent code
-        modulated_z = self.film(z, reward_summary)  # (B, D)
-        
-        # Decode to flattened state segments
-        x_flat = self.decoder(modulated_z)  # (B, T*state_dim)
+        B, T = z.shape[0], self.sequence_length
+
+        # 1) Recompute reward embeddings + pos-emb (same as encode)
+        r = rewards.unsqueeze(1)  # (B,1,T)
+        r_emb = self.reward_encoder(r).transpose(1, 2)  # (B,T,D)
+        r_emb = r_emb + self.pos_emb  # (B, T, D)
+
+        # 2) Project z into D, then cross-attend
+        z_proj = self.decoder_input(z)  # (B,D)
+        # Cross-attend to reward sequence
+        attended = self.decoder_cross_attn(
+            x=z_proj,  # query: (B,D)
+            context=r_emb  # key/value: (B,T,D)
+        )  # returns (B,D)
+
+        # 3) Combine (residual connection) and decode
+        z_final = z_proj + attended  # (B,D)
+        x_flat = self.decoder(z_final)  # (B, T*state_dim)
         
         # Reshape to (batch_size, sequence_length, state_dim)
-        x = x_flat.view(B, self.sequence_length, self.state_dim)
-        
-        return x
+        return x_flat.view(B, T, self.state_dim)
     
     def get_prior(self, rewards: th.Tensor) -> Tuple[th.Tensor, th.Tensor]:
         """Get the conditional prior distribution parameters.
@@ -1038,7 +1068,7 @@ class MLPStateRewardAttentionCVAE(MLPVae):
         prior_params = self.prior_net(rewards)
         mu_prior, logvar_prior = prior_params.chunk(2, dim=1)
         return mu_prior, logvar_prior
-    
+
     def forward(self, x: th.Tensor, rewards: th.Tensor) -> Tuple[th.Tensor, th.Tensor, th.Tensor, th.Tensor, th.Tensor]:
         """Forward pass through CVAE
         
@@ -1088,6 +1118,7 @@ class VAETrainer:
         device: str = "cuda" if th.cuda.is_available() else "cpu",
         lr: float = 1e-3,
         kl_weight_beta: float = 1.0,
+        kl_warmup_epochs: int = 0,  # New parameter for KL warmup
         batch_size: int = 32,
         early_stopping_patience: Optional[int] = None,
         optimizer: Optional[th.optim.Optimizer] = None,
@@ -1101,7 +1132,8 @@ class VAETrainer:
             epochs: The number of epochs to train for
             device: The device to run the training on
             lr: The learning rate
-            kl_weight_beta: The weight for the KL divergence term in the loss function (β-VAE parameter)
+            kl_weight_beta: The base weight for the KL divergence term in the loss function (β-VAE parameter)
+            kl_warmup_epochs: Number of epochs to linearly warm up the KL weight from 0 to kl_weight_beta
             optimizer: The optimizer to use. If None, a default Adam optimizer is used.
             regularizer_factory: The regularizer factory to use
             custom_logger: The logger to use. If None, a default logger is created.
@@ -1111,6 +1143,7 @@ class VAETrainer:
         self.device = device
         self.optimizer = optimizer or th.optim.Adam(vae.parameters(), lr=lr)
         self.kl_weight_beta = kl_weight_beta
+        self.kl_warmup_epochs = kl_warmup_epochs
         self.batch_size = batch_size
         self.early_stopping_patience = early_stopping_patience
         self.logger = custom_logger or imit_logger.configure()
@@ -1124,6 +1157,21 @@ class VAETrainer:
         self.is_attention_cvae = isinstance(vae, MLPStateRewardAttentionCVAE)
         self.is_concat_cvae = isinstance(vae, MLPStateRewardConcatCVAE)
         self.is_cvae = self.is_attention_cvae or self.is_concat_cvae
+
+    def _get_current_kl_weight(self, epoch: int) -> float:
+        """Get the current KL weight based on warmup schedule.
+        
+        Args:
+            epoch: Current training epoch
+            
+        Returns:
+            Current KL weight value
+        """
+        if self.kl_warmup_epochs == 0:
+            return self.kl_weight_beta
+            
+        # Linear warmup from 0 to kl_weight_beta
+        return min(1.0, epoch / self.kl_warmup_epochs) * self.kl_weight_beta
 
     def train(
         self,
@@ -1139,17 +1187,25 @@ class VAETrainer:
         with self.logger.accumulate_means("variquery"):
             for epoch in tqdm(range(self.epochs), desc="Training VAE"):
                 with self.logger.add_key_prefix(f"epoch-{epoch}"):
-                    avg_loss, val_loss = self._train_epoch(dataloader, val_dataloader)
+                    # Get current KL weight based on warmup schedule
+                    current_kl_weight = self._get_current_kl_weight(epoch)
+                    
+                    # Log training metrics
+                    with self.logger.add_key_prefix("train"):
+                        self.logger.log("kl_weight", current_kl_weight)
+                        avg_loss, val_loss = self._train_epoch(dataloader, val_dataloader, current_kl_weight)
 
                     if self.early_stopping_patience is not None and val_loss is not None:
                         if val_loss < best_val_loss:
                             best_val_loss = val_loss
                             patience_counter = 0
+                            self.logger.log("best_val_loss", best_val_loss)
                         else:
                             patience_counter += 1
+                            self.logger.log("patience_counter", patience_counter)
 
                         if patience_counter >= self.early_stopping_patience:
-                            self.logger.log("Early stopping triggered at epoch {}".format(epoch), step=epoch)
+                            self.logger.log("early_stopping_triggered", True)
                             break
 
     def _make_data_loader(
@@ -1230,12 +1286,14 @@ class VAETrainer:
         self,
         train_loader: data_th.DataLoader,
         val_loader: Optional[data_th.DataLoader] = None,
+        current_kl_weight: float = 1.0,
     ) -> Tuple[float, Optional[float]]:
         """Train the VAE for one epoch
         
         Args:
             train_loader: The training data loader
             val_loader: Optional validation data loader, if None, no validation is done
+            current_kl_weight: Current KL weight value for this epoch
 
         Returns:
             Tuple of (avg_loss, val_loss)
@@ -1247,7 +1305,7 @@ class VAETrainer:
         total_kl_loss = 0.0
         num_batches = 0
 
-        for batch in train_loader:
+        for batch_idx, batch in enumerate(train_loader):
             if self.is_cvae:
                 x, rewards = batch
                 x = x.to(self.device).float()  # Ensure float32
@@ -1261,7 +1319,7 @@ class VAETrainer:
                 mu_prior = th.zeros_like(mu)
                 logvar_prior = th.zeros_like(logvar)
 
-            # Compute loss
+            # Compute loss with current KL weight
             loss, recon_loss, kl_loss = self._vae_loss(
                 x=x,
                 mu=mu,
@@ -1269,7 +1327,7 @@ class VAETrainer:
                 x_reconstructed=x_reconstructed,
                 mu_prior=mu_prior,
                 logvar_prior=logvar_prior,
-                kl_weight_beta=self.kl_weight_beta,
+                kl_weight_beta=current_kl_weight,
                 reduction="mean",
             )
 
@@ -1289,19 +1347,29 @@ class VAETrainer:
             total_kl_loss += kl_loss.item()
             num_batches += 1
 
-        # Log training metrics
+            # # Log batch-level metrics
+            # if batch_idx % 10 == 0:  # Log every 10 batches
+            #     with self.logger.add_key_prefix("train/batch"):
+            #         self.logger.record("loss", loss.item())
+            #         self.logger.record("recon_loss", recon_loss.item())
+            #         self.logger.record("kl_loss", kl_loss.item())
+            #         self.logger.record("kl_weight", current_kl_weight)
+
+        # Log epoch-level training metrics
         avg_loss = total_loss / num_batches
         avg_recon_loss = total_recon_loss / num_batches
         avg_kl_loss = total_kl_loss / num_batches
-        with self.logger.add_key_prefix("train"):
-            self.logger.log("loss", avg_loss)
-            self.logger.log("recon_loss", avg_recon_loss)
-            self.logger.log("kl_loss", avg_kl_loss)
+        
+        # with self.logger.add_key_prefix("train/epoch"):
+        #     self.logger.record("loss", avg_loss)
+        #     self.logger.record("recon_loss", avg_recon_loss)
+        #     self.logger.record("kl_loss", avg_kl_loss)
+        #     self.logger.record("kl_weight", current_kl_weight)
             
         # Validation loop
         val_loss = None
         if val_loader is not None:
-            val_loss = self._validate(val_loader)
+            val_loss = self._validate(val_loader, current_kl_weight)
 
         if self.regularizer is not None:
             self.regularizer.update_params(avg_loss, val_loss)
@@ -1312,11 +1380,13 @@ class VAETrainer:
     def _validate(
         self,
         val_loader: data_th.DataLoader,
+        current_kl_weight: float = 1.0,
     ):
         """Validate the VAE on the validation set
 
         Args:
             val_loader: The validation data loader
+            current_kl_weight: Current KL weight value for this epoch
 
         Returns:
             The average loss on the validation set
@@ -1327,7 +1397,7 @@ class VAETrainer:
         val_kl_loss = 0.0
         num_val_batches = 0
 
-        for batch in val_loader:
+        for batch_idx, batch in enumerate(val_loader):
             if self.is_cvae:
                 x, rewards = batch
                 x = x.to(self.device).float()  # Ensure float32
@@ -1341,7 +1411,7 @@ class VAETrainer:
                 mu_prior = th.zeros_like(mu)
                 logvar_prior = th.zeros_like(logvar)
             
-            # Compute loss
+            # Compute loss with current KL weight
             loss, recon_loss, kl_loss = self._vae_loss(
                 x=x,
                 mu=mu,
@@ -1349,7 +1419,7 @@ class VAETrainer:
                 x_reconstructed=x_reconstructed,
                 mu_prior=mu_prior,
                 logvar_prior=logvar_prior,
-                kl_weight_beta=self.kl_weight_beta,
+                kl_weight_beta=current_kl_weight,
                 reduction="mean",
             )
 
@@ -1359,15 +1429,24 @@ class VAETrainer:
             val_kl_loss += kl_loss.item()
             num_val_batches += 1
 
-        # Log validation metrics
+            # Log batch-level validation metrics
+            if batch_idx % 10 == 0:  # Log every 10 batches
+                with self.logger.add_key_prefix("val/batch"):
+                    self.logger.log("loss", loss.item())
+                    self.logger.log("recon_loss", recon_loss.item())
+                    self.logger.log("kl_loss", kl_loss.item())
+                    self.logger.log("kl_weight", current_kl_weight)
+
+        # Log epoch-level validation metrics
         avg_loss = val_loss / num_val_batches
         avg_recon_loss = val_recon_loss / num_val_batches
         avg_kl_loss = val_kl_loss / num_val_batches
 
-        with self.logger.add_key_prefix("val"):
+        with self.logger.add_key_prefix("val/epoch"):
             self.logger.log("loss", avg_loss)
             self.logger.log("recon_loss", avg_recon_loss)
             self.logger.log("kl_loss", avg_kl_loss)
+            self.logger.log("kl_weight", current_kl_weight)
 
         return avg_loss
 
@@ -1402,7 +1481,7 @@ class VAETrainer:
 
         # KL divergence between posterior and conditional prior
         kl_loss = -0.5 * th.sum(
-            1 + (logvar - logvar_prior) 
+            1 + (logvar - logvar_prior)
             - ((mu - mu_prior).pow(2) + logvar.exp()) / logvar_prior.exp(),
             dim=1
         )
