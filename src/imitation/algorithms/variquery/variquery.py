@@ -246,6 +246,224 @@ class ClusterVisualizer:
         if self.logger:
             self.logger.log(f"Saved cluster visualization to {save_path}")
 
+class VAEMetricsVisualizer:
+    """Visualizer for VAE training metrics and latent space analysis."""
+
+    def __init__(self, logger: Optional[imit_logger.HierarchicalLogger] = None):
+        """Initialize the VAE metrics visualizer.
+        
+        Args:
+            logger: Optional logger for tracking visualization progress
+        """
+        self.logger = logger
+        self.metrics_history = {
+            'train': {
+                'loss': [], 'recon_loss': [], 'kl_loss': [], 
+                'active_dims': [], 'recon_quality': []
+            },
+            'val': {
+                'loss': [], 'recon_loss': [], 'kl_loss': [], 
+                'active_dims': [], 'recon_quality': []
+            }
+        }
+        self.latent_stats = {
+            'mu': [], 'sigma': [], 'kl_per_dim': []
+        }
+
+    def update_metrics(self, metrics: Dict[str, float], phase: str = 'train'):
+        """Update the metrics history.
+        
+        Args:
+            metrics: Dictionary of metrics to update
+            phase: Either 'train' or 'val'
+        """
+        for key, value in metrics.items():
+            if key in self.metrics_history[phase]:
+                self.metrics_history[phase][key].append(value)
+
+    def update_latent_stats(self, mu: th.Tensor, logvar: th.Tensor):
+        """Update latent space statistics.
+        
+        Args:
+            mu: Mean of the latent distribution
+            logvar: Log variance of the latent distribution
+        """
+        # Detach tensors before converting to numpy
+        mu = mu.detach()
+        logvar = logvar.detach()
+        
+        sigma = th.exp(0.5 * logvar)
+        kl_per_dim = -0.5 * (1 + logvar - mu.pow(2) - logvar.exp())
+        
+        self.latent_stats['mu'].append(mu.mean(dim=0).cpu().numpy())
+        self.latent_stats['sigma'].append(sigma.mean(dim=0).cpu().numpy())
+        self.latent_stats['kl_per_dim'].append(kl_per_dim.mean(dim=0).cpu().numpy())
+
+    def plot_training_curves(self, save_path: str):
+        """Plot training and validation curves for all metrics.
+        
+        Args:
+            save_path: Path to save the plot
+        """
+        n_metrics = len(self.metrics_history['train'])
+        fig, axes = plt.subplots(n_metrics, 1, figsize=(10, 4*n_metrics))
+        if n_metrics == 1:
+            axes = [axes]
+
+        for ax, (metric_name, _) in enumerate(self.metrics_history['train'].items()):
+            train_values = self.metrics_history['train'][metric_name]
+            val_values = self.metrics_history['val'][metric_name]
+            
+            epochs = range(len(train_values))
+            axes[ax].plot(epochs, train_values, label='Train', color='blue')
+            if val_values:
+                axes[ax].plot(epochs, val_values, label='Validation', color='red')
+            
+            axes[ax].set_title(f'{metric_name.replace("_", " ").title()}')
+            axes[ax].set_xlabel('Epoch')
+            axes[ax].set_ylabel('Value')
+            axes[ax].legend()
+            axes[ax].grid(True)
+
+        plt.tight_layout()
+        plt.savefig(save_path)
+        plt.close()
+
+    def plot_latent_distributions(self, save_path: str):
+        """Plot histograms of latent space distributions.
+        
+        Args:
+            save_path: Path to save the plot
+        """
+        if not self.latent_stats['mu']:
+            return
+
+        # Get the latest statistics
+        latest_mu = self.latent_stats['mu'][-1]
+        latest_sigma = self.latent_stats['sigma'][-1]
+        latest_kl = self.latent_stats['kl_per_dim'][-1]
+        
+        n_dims = len(latest_mu)
+        fig, axes = plt.subplots(3, 1, figsize=(10, 12))
+        
+        # Plot mean distribution
+        axes[0].bar(range(n_dims), latest_mu)
+        axes[0].set_title('Latent Space Mean Distribution')
+        axes[0].set_xlabel('Dimension')
+        axes[0].set_ylabel('Mean Value')
+        
+        # Plot standard deviation distribution
+        axes[1].bar(range(n_dims), latest_sigma)
+        axes[1].set_title('Latent Space Standard Deviation Distribution')
+        axes[1].set_xlabel('Dimension')
+        axes[1].set_ylabel('Standard Deviation')
+        
+        # Plot KL divergence per dimension
+        axes[2].bar(range(n_dims), latest_kl)
+        axes[2].set_title('KL Divergence per Dimension')
+        axes[2].set_xlabel('Dimension')
+        axes[2].set_ylabel('KL Divergence')
+        
+        plt.tight_layout()
+        plt.savefig(save_path)
+        plt.close()
+
+    def plot_kl_heatmap(self, save_path: str):
+        """Plot heatmap of KL divergence across dimensions and epochs.
+        
+        Args:
+            save_path: Path to save the plot
+        """
+        if not self.latent_stats['kl_per_dim']:
+            return
+
+        kl_matrix = np.array(self.latent_stats['kl_per_dim'])
+        plt.figure(figsize=(12, 6))
+        plt.imshow(kl_matrix.T, aspect='auto', cmap='viridis')
+        plt.colorbar(label='KL Divergence')
+        plt.title('KL Divergence Heatmap Across Dimensions and Epochs')
+        plt.xlabel('Epoch')
+        plt.ylabel('Latent Dimension')
+        plt.tight_layout()
+        plt.savefig(save_path)
+        plt.close()
+
+    def compute_disentanglement_metrics(self, encoded_data: th.Tensor, factors: th.Tensor) -> Dict[str, float]:
+        """Compute disentanglement metrics using the DCI framework.
+        
+        Args:
+            encoded_data: Encoded data points
+            factors: Ground truth factors of variation
+            
+        Returns:
+            Dictionary of disentanglement metrics
+        """
+        from sklearn.linear_model import LassoCV
+        
+        # Normalize the data
+        encoded_data = (encoded_data - encoded_data.mean(dim=0)) / encoded_data.std(dim=0)
+        factors = (factors - factors.mean(dim=0)) / factors.std(dim=0)
+        
+        # Compute importance matrix
+        importance_matrix = np.zeros((encoded_data.shape[1], factors.shape[1]))
+        for i in range(factors.shape[1]):
+            model = LassoCV()
+            model.fit(encoded_data.cpu().numpy(), factors[:, i].cpu().numpy())
+            importance_matrix[:, i] = np.abs(model.coef_)
+        
+        # Compute disentanglement score
+        importance_matrix = importance_matrix / importance_matrix.sum(axis=0)
+        disentanglement = 1 - np.mean(
+            np.sum(importance_matrix * (1 - importance_matrix), axis=1)
+        )
+        
+        # Compute completeness
+        completeness = 1 - np.mean(
+            np.sum(importance_matrix * (1 - importance_matrix), axis=0)
+        )
+        
+        # Compute informativeness (R² score)
+        informativeness = np.mean([
+            model.score(encoded_data.cpu().numpy(), factors[:, i].cpu().numpy())
+            for i in range(factors.shape[1])
+        ])
+        
+        return {
+            'disentanglement': disentanglement,
+            'completeness': completeness,
+            'informativeness': informativeness
+        }
+
+    def visualize_all(self, base_dir: str, iteration: int):
+        """Generate all visualizations for the current iteration.
+        
+        Args:
+            base_dir: Base directory to save visualizations
+            iteration: Current outer training iteration number
+        """
+        # Create subdirectories for different types of visualizations
+        training_dir = os.path.join(base_dir, "training_curves")
+        latent_dir = os.path.join(base_dir, "latent_space")
+        kl_dir = os.path.join(base_dir, "kl_divergence")
+        
+        for dir_path in [training_dir, latent_dir, kl_dir]:
+            os.makedirs(dir_path, exist_ok=True)
+        
+        # Plot training curves
+        self.plot_training_curves(
+            os.path.join(training_dir, f'training_curves_iter_{iteration:04d}.png')
+        )
+        
+        # Plot latent distributions
+        self.plot_latent_distributions(
+            os.path.join(latent_dir, f'latent_distributions_iter_{iteration:04d}.png')
+        )
+        
+        # Plot KL heatmap
+        self.plot_kl_heatmap(
+            os.path.join(kl_dir, f'kl_heatmap_iter_{iteration:04d}.png')
+        )
+
 class VARIQueryFragmenter(Fragmenter):
     """
     Fragmenter for the VARIQuery algorithm. This fragmenter is used to sample trajectories
@@ -270,16 +488,16 @@ class VARIQueryFragmenter(Fragmenter):
         vae_batch_size: int = 32,
         vae_lr: float = 1e-3,
         vae_kl_weight: float = 1.0,
+        vae_kl_warmup_epochs: Optional[int] = None,
         vae_early_stopping_patience: Optional[int] = None,
+        vae_dropout: float = 0.1,
         fragment_sample_factor: float = 2.0,
         device: str = "cuda" if th.cuda.is_available() else "cpu",
-        visualization_interval: int = 10,
     ):
         super().__init__(custom_logger)
         self.allow_variable_horizon = allow_variable_horizon
         self.preference_model = preference_model
         self.fragment_sample_factor = fragment_sample_factor
-        self.visualization_interval = visualization_interval
         self.visualizer = ClusterVisualizer(custom_logger)
         
         # Use provided base_fragmenter or create default RandomFragmenter
@@ -298,6 +516,7 @@ class VARIQueryFragmenter(Fragmenter):
         self.vae_batch_size = vae_batch_size
         self.vae_lr = vae_lr
         self.vae_kl_weight = vae_kl_weight
+        self.vae_kl_warmup_epochs = vae_kl_warmup_epochs
         self.vae_early_stopping_patience = vae_early_stopping_patience
         self.device = device
         
@@ -307,6 +526,7 @@ class VARIQueryFragmenter(Fragmenter):
             latent_dim=vae_latent_dim,
             hidden_dims=vae_hidden_dims,
             custom_logger=self.logger,
+            dropout=vae_dropout,
         )
 
     def __call__(
@@ -352,14 +572,11 @@ class VARIQueryFragmenter(Fragmenter):
         # Always create visualization directory
         output_dir = self.logger.get_dir()
         os.makedirs(output_dir, exist_ok=True)
-        
-        # Visualize if it's time to do so or if it's the first iteration
-        should_visualize = self.current_iteration == 0 or self.current_iteration % self.visualization_interval == 0
-        
-        if should_visualize:
-            self.logger.log(f"Creating visualization for iteration {self.current_iteration}")
+
+        if self.current_iteration % 10 == 0:
+            # Visualize clusters
             viz_path = os.path.join(
-                output_dir, 
+                output_dir,
                 f"clusters_iteration_{self.current_iteration:04d}.png"
             )
             self.visualizer.visualize_clusters_and_pairs(
@@ -508,6 +725,7 @@ class VARIQueryFragmenter(Fragmenter):
             device=self.device,
             lr=self.vae_lr,
             kl_weight_beta=self.vae_kl_weight,
+            kl_warmup_epochs=self.vae_kl_warmup_epochs,
             batch_size=self.vae_batch_size,
             early_stopping_patience=self.vae_early_stopping_patience,
             optimizer=th.optim.Adam(self.vae.parameters(), lr=self.vae_lr),
@@ -518,7 +736,7 @@ class VARIQueryFragmenter(Fragmenter):
         self.vae = self.vae.to(self.device)
         
         # Train the VAE
-        trainer.train(dataset)
+        trainer.train(dataset, self.current_iteration)
 
 class MLPStateVAE(nn.Module):
     """
@@ -532,6 +750,7 @@ class MLPStateVAE(nn.Module):
         latent_dim: int,
         hidden_dims: List[int] = [128, 64, 32],
         custom_logger: Optional[imit_logger.HierarchicalLogger] = None,
+        dropout: float = 0.1,
     ):
         super().__init__()
 
@@ -541,6 +760,10 @@ class MLPStateVAE(nn.Module):
         self.hidden_dims = hidden_dims
         self.flat_dim = state_dim * sequence_length
         self.logger = custom_logger or imit_logger.configure()
+        self.dropout = dropout
+
+        self.logger.info("VAE STATE DIM: {}".format(self.state_dim))
+        self.logger.info("VAE SEQUENCE LENGTH: {}".format(self.sequence_length))
 
         self.encoder = self._create_encoder()
         self.decoder = self._create_decoder()
@@ -567,6 +790,7 @@ class MLPStateVAE(nn.Module):
             decoder_layers.extend([
                 nn.Linear(in_dim, hidden_dim),
                 nn.ReLU(),
+                nn.Dropout(p=self.dropout),  # Add dropout after each hidden layer
             ])
             in_dim = hidden_dim
         decoder_layers.extend([
@@ -662,6 +886,7 @@ class VAETrainer:
         optimizer: Optional[th.optim.Optimizer] = None,
         regularizer_factory: Optional[regularizers.RegularizerFactory] = None,
         custom_logger: Optional[imit_logger.HierarchicalLogger] = None,
+        kl_warmup_epochs: Optional[int] = None,
     ):
         """Initialize the VAETrainer
         
@@ -670,10 +895,13 @@ class VAETrainer:
             epochs: The number of epochs to train for
             device: The device to run the training on
             lr: The learning rate
-            kl_weight_beta: The weight for the KL divergence term in the loss function (β-VAE parameter)
+            kl_weight_beta: The target weight for the KL divergence term in the loss function (β-VAE parameter)
+            batch_size: The batch size for training
+            early_stopping_patience: Number of epochs to wait before early stopping
             optimizer: The optimizer to use. If None, a default Adam optimizer is used.
             regularizer_factory: The regularizer factory to use
             custom_logger: The logger to use. If None, a default logger is created.
+            kl_warmup_epochs: Number of epochs to warm up the KL weight. If None, no warmup is used.
         """
         self.vae = vae.to(device)
         self.epochs = epochs
@@ -688,10 +916,74 @@ class VAETrainer:
             if regularizer_factory is not None
             else None
         )
+        self.visualizer = VAEMetricsVisualizer(self.logger)
+        
+        # KL warmup settings
+        self.kl_warmup_epochs = kl_warmup_epochs
+        if kl_warmup_epochs is not None:
+            if kl_warmup_epochs >= epochs:
+                raise ValueError("kl_warmup_epochs must be less than total epochs")
+
+    def _get_kl_weight(self, epoch: int) -> float:
+        """Compute the current KL weight based on linear warmup.
+        
+        Args:
+            epoch: Current epoch number
+            
+        Returns:
+            Current KL weight to use in the loss function
+        """
+        if self.kl_warmup_epochs is None or epoch >= self.kl_warmup_epochs:
+            return self.kl_weight_beta
+            
+        # Linear warmup: β = min(1.0, epoch / N_warmup) * β_target
+        progress = epoch / self.kl_warmup_epochs
+        return min(1.0, progress) * self.kl_weight_beta
+
+    def _compute_active_dimensions(self, mu: th.Tensor, logvar: th.Tensor) -> float:
+        """Compute the number of active dimensions in the latent space.
+        
+        A dimension is considered active if its variance is significantly different from 1.
+        
+        Args:
+            mu: Mean of the latent distribution
+            logvar: Log variance of the latent distribution
+            
+        Returns:
+            Number of active dimensions
+        """
+        # Convert logvar to variance
+        var = th.exp(logvar)
+        
+        # A dimension is considered active if its variance is significantly different from 1
+        # We use a threshold of 0.1 to determine significance
+        active_dims = th.sum(th.abs(var - 1.0) > 0.1, dim=1).float().mean()
+        
+        return active_dims.item()
+
+    def _compute_reconstruction_quality(self, x: th.Tensor, x_reconstructed: th.Tensor) -> float:
+        """Compute reconstruction quality using normalized MSE.
+        
+        Args:
+            x: Original input
+            x_reconstructed: Reconstructed input
+            
+        Returns:
+            Reconstruction quality score (lower is better)
+        """
+        # Compute MSE
+        mse = F.mse_loss(x_reconstructed, x, reduction='none')
+        
+        # Normalize by input variance
+        input_var = th.var(x, dim=(1, 2), keepdim=True)
+        normalized_mse = mse / (input_var + 1e-8)
+        
+        return normalized_mse.mean().item()
 
     def train(
         self,
-        dataset: StateSegmentDataset    
+        dataset: StateSegmentDataset,
+        iteration: int,
     ):
         dataloader, val_dataloader = self._create_data_loaders(dataset)
 
@@ -703,7 +995,7 @@ class VAETrainer:
         with self.logger.accumulate_means("variquery"):
             for epoch in tqdm(range(self.epochs), desc="Training VAE"):
                 with self.logger.add_key_prefix(f"epoch-{epoch}"):
-                    avg_loss, val_loss = self._train_epoch(dataloader, val_dataloader)
+                    avg_loss, val_loss = self._train_epoch(dataloader, val_dataloader, epoch)
 
                     if self.early_stopping_patience is not None and val_loss is not None:
                         if val_loss < best_val_loss:
@@ -715,6 +1007,10 @@ class VAETrainer:
                         if patience_counter >= self.early_stopping_patience:
                             self.logger.log("Early stopping triggered at epoch {}".format(epoch), step=epoch)
                             break
+
+            # Generate visualizations after all epochs are complete
+            base_dir = os.path.join(self.logger.get_dir(), "vae_visualizations")
+            self.visualizer.visualize_all(base_dir, iteration)
 
     def _make_data_loader(
         self,
@@ -780,17 +1076,19 @@ class VAETrainer:
             val_dataloader = None
 
         return dataloader, val_dataloader
-    
+
     def _train_epoch(
         self,
         train_loader: data_th.DataLoader,
         val_loader: Optional[data_th.DataLoader] = None,
+        epoch: int = 0,
     ) -> Tuple[float, Optional[float]]:
         """Train the VAE for one epoch
         
         Args:
             train_loader: The training data loader
             val_loader: Optional validation data loader, if None, no validation is done
+            epoch: Current epoch number (used for KL warmup)
 
         Returns:
             Tuple of (avg_loss, val_loss)
@@ -800,7 +1098,18 @@ class VAETrainer:
         total_loss = 0.0
         total_recon_loss = 0.0
         total_kl_loss = 0.0
+        total_active_dims = 0.0
+        total_recon_quality = 0.0
         num_batches = 0
+
+        # Get current KL weight based on warmup schedule
+        current_kl_weight = self._get_kl_weight(epoch)
+        if self.logger:
+            self.logger.record("vae/kl_weight", current_kl_weight)
+
+        # Collect all mu and logvar for visualization
+        all_mu = []
+        all_logvar = []
 
         for batch in train_loader:
             batch = batch.to(self.device)
@@ -808,15 +1117,22 @@ class VAETrainer:
             # Forward pass
             x_reconstructed, mu, logvar = self.vae(batch)
 
-            # Compute loss
+            # Store mu and logvar for later visualization
+            all_mu.append(mu.detach())
+            all_logvar.append(logvar.detach())
+
+            # Compute loss with current KL weight
             loss, recon_loss, kl_loss = self._vae_loss(
                 x=batch,
                 mu=mu,
                 logvar=logvar,
-                x_reconstructed=x_reconstructed,
-                kl_weight_beta=self.kl_weight_beta,
-                reduction="mean",
+                x_recon=x_reconstructed,
+                kl_weight_beta=current_kl_weight,
             )
+
+            # Compute additional metrics
+            active_dims = self._compute_active_dimensions(mu, logvar)
+            recon_quality = self._compute_reconstruction_quality(batch, x_reconstructed)
 
             # Backward pass
             self.optimizer.zero_grad()
@@ -828,28 +1144,43 @@ class VAETrainer:
 
             self.optimizer.step()
 
-            # Accumulate losses
+            # Accumulate losses and metrics
             total_loss += loss.item()
             total_recon_loss += recon_loss.item()
             total_kl_loss += kl_loss.item()
+            total_active_dims += active_dims
+            total_recon_quality += recon_quality
             num_batches += 1
 
-        # Log training metrics
+        # Compute average metrics
         avg_loss = total_loss / num_batches
         avg_recon_loss = total_recon_loss / num_batches
         avg_kl_loss = total_kl_loss / num_batches
-        with self.logger.add_key_prefix("train"):
-          self.logger.log("loss", avg_loss)
-          self.logger.log("recon_loss", avg_recon_loss)
-          self.logger.log("kl_loss", avg_kl_loss)
+        avg_active_dims = total_active_dims / num_batches
+        avg_recon_quality = total_recon_quality / num_batches
+
+        # Update visualizer with training metrics
+        self.visualizer.update_metrics({
+            'loss': avg_loss,
+            'recon_loss': avg_recon_loss,
+            'kl_loss': avg_kl_loss,
+            'active_dims': avg_active_dims,
+            'recon_quality': avg_recon_quality
+        }, phase='train')
+
+        # Update latent stats with collected mu and logvar
+        if all_mu and all_logvar:
+            combined_mu = th.cat(all_mu, dim=0)
+            combined_logvar = th.cat(all_logvar, dim=0)
+            self.visualizer.update_latent_stats(combined_mu, combined_logvar)
             
         # Validation loop
         val_loss = None
         if val_loader is not None:
-            val_loss = self._validate(val_loader)
+            val_loss = self._validate(val_loader, epoch)
 
         if self.regularizer is not None:
-          self.regularizer.update_params(avg_loss, val_loss)
+            self.regularizer.update_params(avg_loss, val_loss)
 
         return avg_loss, val_loss
 
@@ -857,11 +1188,13 @@ class VAETrainer:
     def _validate(
         self,
         val_loader: data_th.DataLoader,
+        epoch: int = 0,
     ):
         """Validate the VAE on the validation set
 
         Args:
             val_loader: The validation data loader
+            epoch: Current epoch number (used for KL warmup)
 
         Returns:
             The average loss on the validation set
@@ -870,7 +1203,16 @@ class VAETrainer:
         val_loss = 0.0
         val_recon_loss = 0.0
         val_kl_loss = 0.0
+        val_active_dims = 0.0
+        val_recon_quality = 0.0
         num_val_batches = 0
+
+        # Get current KL weight based on warmup schedule
+        current_kl_weight = self._get_kl_weight(epoch)
+
+        # Collect all mu and logvar for visualization
+        all_mu = []
+        all_logvar = []
 
         for batch in val_loader:
             batch = batch.to(self.device)
@@ -878,43 +1220,62 @@ class VAETrainer:
             # Forward pass
             x_reconstructed, mu, logvar = self.vae(batch)
 
-            # Compute loss
+            # Store mu and logvar for later visualization
+            all_mu.append(mu)
+            all_logvar.append(logvar)
+
+            # Compute loss with current KL weight
             loss, recon_loss, kl_loss = self._vae_loss(
                 x=batch,
                 mu=mu,
                 logvar=logvar,
-                x_reconstructed=x_reconstructed,
-                kl_weight_beta=self.kl_weight_beta,
-                reduction="mean",
+                x_recon=x_reconstructed,
+                kl_weight_beta=current_kl_weight,
             )
 
-            # Accumulate losses
+            # Compute additional metrics
+            active_dims = self._compute_active_dimensions(mu, logvar)
+            recon_quality = self._compute_reconstruction_quality(batch, x_reconstructed)
+
+            # Accumulate losses and metrics
             val_loss += loss.item()
             val_recon_loss += recon_loss.item()
             val_kl_loss += kl_loss.item()
+            val_active_dims += active_dims
+            val_recon_quality += recon_quality
             num_val_batches += 1
 
-        # Log validation metrics
+        # Compute average metrics
         avg_loss = val_loss / num_val_batches
         avg_recon_loss = val_recon_loss / num_val_batches
         avg_kl_loss = val_kl_loss / num_val_batches
+        avg_active_dims = val_active_dims / num_val_batches
+        avg_recon_quality = val_recon_quality / num_val_batches
 
-        with self.logger.add_key_prefix("val"):
-          self.logger.log("loss", avg_loss)
-          self.logger.log("recon_loss", avg_recon_loss)
-          self.logger.log("kl_loss", avg_kl_loss)
+        # Update visualizer with validation metrics
+        self.visualizer.update_metrics({
+            'loss': avg_loss,
+            'recon_loss': avg_recon_loss,
+            'kl_loss': avg_kl_loss,
+            'active_dims': avg_active_dims,
+            'recon_quality': avg_recon_quality
+        }, phase='val')
+
+        # Update latent stats with collected mu and logvar
+        if all_mu and all_logvar:
+            combined_mu = th.cat(all_mu, dim=0)
+            combined_logvar = th.cat(all_logvar, dim=0)
+            self.visualizer.update_latent_stats(combined_mu, combined_logvar)
 
         return avg_loss
-        
 
     def _vae_loss(
         self, 
         x: th.Tensor, 
         mu: th.Tensor, 
         logvar: th.Tensor,
-        x_reconstructed: th.Tensor,
+        x_recon: th.Tensor,
         kl_weight_beta: float = 1.0,
-        reduction: str = "mean",
     ) -> Tuple[th.Tensor, th.Tensor, th.Tensor]:
         """Compute VAE loss (reconstruction + KL divergence)
         
@@ -922,27 +1283,25 @@ class VAETrainer:
             x: Tensor of shape (batch_size, sequence_length, state_dim)
             mu: Tensor of shape (batch_size, latent_dim)
             logvar: Tensor of shape (batch_size, latent_dim)
-            x_reconstructed: Tensor of shape (batch_size, sequence_length, state_dim)
+            x_recon: Tensor of shape (batch_size, sequence_length, state_dim)
             kl_weight_beta: Weight for KL divergence (β-VAE parameter)
-            reduction: Reduction method ("mean", "sum", "none")
 
         Returns:
             Tuple of (loss, recon_loss, kl_loss)
         """
-        # Reconstruction loss
-        recon_loss = F.mse_loss(x_reconstructed, x, reduction=reduction)
+        recon_el = F.mse_loss(x_recon, x, reduction="none")  # (B, S, D)
 
-        # KL divergence
-        kl_loss = -0.5 * th.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=1)
-        if reduction == "mean":
-            kl_loss = kl_loss.mean()
-        elif reduction == "sum":
-            kl_loss = kl_loss.sum()
+        # 2) sum over feature dims → per‐sample
+        B = x.shape[0]
+        recon_per_sample = recon_el.view(B, -1).sum(dim=1)  # (B,)
+        kl_per_sample = -0.5 * (1 + logvar - mu.pow(2) - logvar.exp()).sum(dim=1)  # (B,)
 
-        # Total loss
-        loss = recon_loss + kl_weight_beta * kl_loss
+        recon_loss = recon_per_sample.mean()
+        kl_loss = kl_per_sample.mean()
 
-        return loss, recon_loss, kl_loss
+        total_loss = recon_loss + kl_weight_beta * kl_loss
+
+        return total_loss, recon_loss, kl_loss
 
         
     
