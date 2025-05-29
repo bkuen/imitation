@@ -43,6 +43,28 @@ class StateSegmentDataset(data_th.Dataset):
         if len(self.fragments) == 0:
             raise ValueError("No fragments provided. The fragment sequence is empty.")
 
+        # Initialize normalization stats
+        self.mu = None
+        self.sigma = None
+
+        # Compute normalization statistics
+        self._compute_normalization_stats()
+
+    def _compute_normalization_stats(self):
+        """Compute mean and standard deviation for each feature dimension."""
+        # Stack all raw fragments into a single tensor
+        all_data = th.stack([
+            th.from_numpy(fragment.obs[:self.fragment_length]).float()
+            for fragment in self.fragments
+        ], dim=0)
+        
+        # Compute mean and std across all samples and time steps
+        self.mu = all_data.mean(dim=(0, 1))  # Mean across batch and time
+        self.sigma = all_data.std(dim=(0, 1))  # Std across batch and time
+        
+        # Add small epsilon to avoid division by zero
+        self.sigma = th.clamp(self.sigma, min=1e-6)
+
     def __len__(self):
         return len(self.fragments)
 
@@ -62,7 +84,16 @@ class StateSegmentDataset(data_th.Dataset):
         excluding the final observation which is only needed for RL.
         """
         fragment = self.fragments[idx]
-        return th.from_numpy(fragment.obs[:self.fragment_length]).float()
+        tensor = th.from_numpy(fragment.obs[:self.fragment_length]).float()
+        
+        # Apply standardization
+        tensor = (tensor - self.mu) / self.sigma
+        
+        return tensor
+
+    def denormalize(self, tensor: th.Tensor) -> th.Tensor:
+        """Convert standardized tensor back to original scale"""
+        return tensor * self.sigma + self.mu
 
 class ClusterVisualizer:
     """Visualizer for clusters and selected pairs in the latent space."""
@@ -779,31 +810,39 @@ class MLPStateVAE(nn.Module):
             encoder_layers.extend([
                 nn.Linear(in_dim, hidden_dim),
                 nn.ReLU(),
+                # nn.BatchNorm1d(hidden_dim),  # Add batch normalization
             ])
             in_dim = hidden_dim
         return nn.Sequential(*encoder_layers)
     
     def _create_decoder(self):
-        decoder_layers = []
+        # Create a ModuleList to store decoder layers
+        decoder_layers = nn.ModuleList()
+        
+        # First layer takes latent_dim as input
         in_dim = self.latent_dim
         for hidden_dim in reversed(self.hidden_dims):
-            decoder_layers.extend([
-                nn.Linear(in_dim, hidden_dim),
+            # Each layer will receive both the previous layer's output and the latent code
+            layer = nn.Sequential(
+                nn.Linear(in_dim + self.latent_dim, hidden_dim),
                 nn.ReLU(),
-                nn.Dropout(p=self.dropout),  # Add dropout after each hidden layer
-            ])
+                # nn.BatchNorm1d(hidden_dim),  # Add batch normalization
+                nn.Dropout(p=self.dropout),
+            )
+            decoder_layers.append(layer)
             in_dim = hidden_dim
-        decoder_layers.extend([
-            nn.Linear(in_dim, self.flat_dim),
-            # No activation - raw outputs for MSE loss
-        ])
-        return nn.Sequential(*decoder_layers)
+            
+        # Final layer to reconstruct the input
+        final_layer = nn.Linear(in_dim + self.latent_dim, self.flat_dim)
+        decoder_layers.append(final_layer)
+        
+        return decoder_layers
     
     def encode(self, x: th.Tensor) -> th.Tensor:
         """Encode state segments into latent space
         
         Args:
-            x: (batch_size, fragment_length, state_dim)
+            x: (batch_size, fragment_length, state_dim) - already standardized
 
         Returns:
             Tuple of (mu, logvar) each of shape (batch_size, latent_dim)
@@ -839,19 +878,23 @@ class MLPStateVAE(nn.Module):
         return mu + eps * std
     
     def decode(self, z: th.Tensor) -> th.Tensor:
-        """Decode latent space samples into state segments
+        """Decode latent space samples into state segments with skip connections
         
         Args:
             z: Tensor of shape (batch_size, latent_dim)
 
         Returns:
-            Tensor of shape (batch_size, sequence_length, state_dim)
+            Tensor of shape (batch_size, sequence_length, state_dim) - in standardized form
         """
-        # Decode to flattened state segments
-        x_flat = self.decoder(z)
+        # Start with the latent code
+        x = z
+        
+        # Pass through decoder layers with skip connections
+        for layer in self.decoder:
+            x = layer(th.cat([x, z], dim=1))
         
         # Reshape to (batch_size, sequence_length, state_dim)
-        x = x_flat.view(-1, self.sequence_length, self.state_dim)
+        x = x.view(-1, self.sequence_length, self.state_dim)
 
         return x
     
@@ -859,10 +902,10 @@ class MLPStateVAE(nn.Module):
         """Forward pass through VAE
         
         Args:
-            x: Tensor of shape (batch_size, sequence_length, state_dim)
+            x: Tensor of shape (batch_size, sequence_length, state_dim) - already standardized
             
         Returns:
-            Tuple of (x_reconstructed, mu, logvar)
+            Tuple of (x_reconstructed, mu, logvar) - x_reconstructed is in standardized form
         """
         mu, logvar, z = self.encode(x)
         x_reconstructed = self.decode(z)
@@ -965,7 +1008,7 @@ class VAETrainer:
         """Compute reconstruction quality using normalized MSE.
         
         Args:
-            x: Original input
+            x: Original input (already standardized)
             x_reconstructed: Reconstructed input
             
         Returns:
@@ -974,11 +1017,8 @@ class VAETrainer:
         # Compute MSE
         mse = F.mse_loss(x_reconstructed, x, reduction='none')
         
-        # Normalize by input variance
-        input_var = th.var(x, dim=(1, 2), keepdim=True)
-        normalized_mse = mse / (input_var + 1e-8)
-        
-        return normalized_mse.mean().item()
+        # Since data is already standardized, we can use a simpler metric
+        return mse.mean().item()
 
     def train(
         self,
