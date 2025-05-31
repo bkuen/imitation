@@ -95,6 +95,7 @@ def train_preference_comparisons(
     vae_kl_warmup_epochs: Optional[int],
     vae_dropout: float,
     vae_early_stopping_patience: Optional[int],
+    vae_latent_injection: bool,
     uncertainty_on: str,
     uncertainty_consensual_filtering: bool,
     fragmenter_kwargs: Mapping[str, Any],
@@ -288,6 +289,7 @@ def train_preference_comparisons(
                 vae_batch_size=vae_batch_size,
                 vae_dropout=vae_dropout,
                 vae_early_stopping_patience=vae_early_stopping_patience,
+                vae_latent_injection=vae_latent_injection,
                 custom_logger=custom_logger,
                 device=agent_trainer.algorithm.device,
             )

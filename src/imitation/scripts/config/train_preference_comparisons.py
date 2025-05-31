@@ -68,6 +68,7 @@ def train_defaults():
     vae_epochs = 10
     vae_dropout = 0.1
     vae_early_stopping_patience = None,
+    vae_latent_injection = False
     uncertainty_on = "logit"
     uncertainty_consensual_filtering = False
     fragmenter_kwargs = {

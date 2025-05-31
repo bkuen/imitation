@@ -1,12 +1,9 @@
-import torch
 from sklearn.cluster import KMeans
-from sklearn.manifold import TSNE
 import matplotlib.pyplot as plt
 import os
 from imitation.algorithms.preference_comparisons import Fragmenter, PreferenceModel, RandomFragmenter
 from imitation.data import rollout
 from imitation.regularization import regularizers
-from imitation.rewards import reward_nets
 from imitation.util import logger as imit_logger, util
 from imitation.data.types import (
     TrajectoryWithRew,
@@ -522,6 +519,7 @@ class VARIQueryFragmenter(Fragmenter):
         vae_kl_warmup_epochs: Optional[int] = None,
         vae_early_stopping_patience: Optional[int] = None,
         vae_dropout: float = 0.1,
+        vae_latent_injection: bool = False,
         fragment_sample_factor: float = 2.0,
         device: str = "cuda" if th.cuda.is_available() else "cpu",
     ):
@@ -558,6 +556,7 @@ class VARIQueryFragmenter(Fragmenter):
             hidden_dims=vae_hidden_dims,
             custom_logger=self.logger,
             dropout=vae_dropout,
+            latent_injection=vae_latent_injection,
         )
 
     def __call__(
@@ -782,6 +781,7 @@ class MLPStateVAE(nn.Module):
         hidden_dims: List[int] = [128, 64, 32],
         custom_logger: Optional[imit_logger.HierarchicalLogger] = None,
         dropout: float = 0.1,
+        latent_injection: bool = True,  # Whether to inject latent vector at each decoder layer
     ):
         super().__init__()
 
@@ -792,9 +792,11 @@ class MLPStateVAE(nn.Module):
         self.flat_dim = state_dim * sequence_length
         self.logger = custom_logger or imit_logger.configure()
         self.dropout = dropout
+        self.latent_injection = latent_injection
 
         self.logger.info("VAE STATE DIM: {}".format(self.state_dim))
         self.logger.info("VAE SEQUENCE LENGTH: {}".format(self.sequence_length))
+        self.logger.info("VAE LATENT INJECTION: {}".format(self.latent_injection))
 
         self.encoder = self._create_encoder()
         self.decoder = self._create_decoder()
@@ -810,7 +812,6 @@ class MLPStateVAE(nn.Module):
             encoder_layers.extend([
                 nn.Linear(in_dim, hidden_dim),
                 nn.ReLU(),
-                # nn.BatchNorm1d(hidden_dim),  # Add batch normalization
             ])
             in_dim = hidden_dim
         return nn.Sequential(*encoder_layers)
@@ -822,18 +823,27 @@ class MLPStateVAE(nn.Module):
         # First layer takes latent_dim as input
         in_dim = self.latent_dim
         for hidden_dim in reversed(self.hidden_dims):
-            # Each layer will receive both the previous layer's output and the latent code
-            layer = nn.Sequential(
-                nn.Linear(in_dim + self.latent_dim, hidden_dim),
-                nn.ReLU(),
-                # nn.BatchNorm1d(hidden_dim),  # Add batch normalization
-                nn.Dropout(p=self.dropout),
-            )
+            # Each layer will receive both the previous layer's output and the latent code if latent_injection is True
+            if self.latent_injection:
+                layer = nn.Sequential(
+                    nn.Linear(in_dim + self.latent_dim, hidden_dim),
+                    nn.ReLU(),
+                    nn.Dropout(p=self.dropout),
+                )
+            else:
+                layer = nn.Sequential(
+                    nn.Linear(in_dim, hidden_dim),
+                    nn.ReLU(),
+                    nn.Dropout(p=self.dropout),
+                )
             decoder_layers.append(layer)
             in_dim = hidden_dim
             
         # Final layer to reconstruct the input
-        final_layer = nn.Linear(in_dim + self.latent_dim, self.flat_dim)
+        if self.latent_injection:
+            final_layer = nn.Linear(in_dim + self.latent_dim, self.flat_dim)
+        else:
+            final_layer = nn.Linear(in_dim, self.flat_dim)
         decoder_layers.append(final_layer)
         
         return decoder_layers
@@ -889,9 +899,12 @@ class MLPStateVAE(nn.Module):
         # Start with the latent code
         x = z
         
-        # Pass through decoder layers with skip connections
+        # Pass through decoder layers with skip connections if enabled
         for layer in self.decoder:
-            x = layer(th.cat([x, z], dim=1))
+            if self.latent_injection:
+                x = layer(th.cat([x, z], dim=1))
+            else:
+                x = layer(x)
         
         # Reshape to (batch_size, sequence_length, state_dim)
         x = x.view(-1, self.sequence_length, self.state_dim)
