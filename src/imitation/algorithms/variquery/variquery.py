@@ -735,6 +735,7 @@ class VARIQueryFragmenter(Fragmenter):
         vae_epochs: int = 10,
         vae_batch_size: int = 32,
         vae_lr: float = 1e-3,
+        vae_weight_decay: float = 0.0,
         vae_kl_weight: float = 1.0,
         vae_kl_warmup_epochs: Optional[int] = None,
         vae_early_stopping_patience: Optional[int] = None,
@@ -767,6 +768,7 @@ class VARIQueryFragmenter(Fragmenter):
         self.vae_epochs = vae_epochs
         self.vae_batch_size = vae_batch_size
         self.vae_lr = vae_lr
+        self.vae_weight_decay = vae_weight_decay
         self.vae_kl_weight = vae_kl_weight
         self.vae_kl_warmup_epochs = vae_kl_warmup_epochs
         self.vae_early_stopping_patience = vae_early_stopping_patience
@@ -1004,7 +1006,7 @@ class VARIQueryFragmenter(Fragmenter):
             kl_warmup_epochs=self.vae_kl_warmup_epochs,
             batch_size=self.vae_batch_size,
             early_stopping_patience=self.vae_early_stopping_patience,
-            optimizer=th.optim.Adam(self.vae.parameters(), lr=self.vae_lr),
+            optimizer=th.optim.Adam(self.vae.parameters(), lr=self.vae_lr, weight_decay=self.vae_weight_decay),
             custom_logger=self.logger,
             val_split=self.vae_val_split,
         )
@@ -1052,7 +1054,7 @@ class VAETrainer:
         self.vae = vae.to(device)
         self.epochs = epochs
         self.device = device
-        self.optimizer = optimizer or th.optim.Adam(vae.parameters(), lr=lr)
+        self.optimizer = optimizer or th.optim.Adam(vae.parameters(), lr=lr, weight_decay=0.1)
         self.kl_weight_beta = kl_weight_beta
         self.batch_size = batch_size
         self.early_stopping_patience = early_stopping_patience
