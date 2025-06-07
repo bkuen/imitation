@@ -2,6 +2,9 @@ from cmath import phase
 from sklearn.cluster import KMeans
 import matplotlib.pyplot as plt
 import os
+
+from helpers.playground.kruskal import uncertainty
+from imitation.algorithms.duo.duo import RewardDifferenceSelector
 from imitation.algorithms.preference_comparisons import Fragmenter, PreferenceModel, RandomFragmenter
 from imitation.data import rollout
 from imitation.regularization import regularizers, updaters
@@ -745,12 +748,14 @@ class VARIQueryFragmenter(Fragmenter):
         vae_val_split: float = 0.1,  # New parameter for validation split
         fragment_sample_factor: float = 2.0,
         device: str = "cuda" if th.cuda.is_available() else "cpu",
+        duo_mode: bool = True,
     ):
         super().__init__(custom_logger)
         self.allow_variable_horizon = allow_variable_horizon
         self.preference_model = preference_model
         self.fragment_sample_factor = fragment_sample_factor
         self.visualizer = ClusterVisualizer(custom_logger)
+        self.duo_mode = duo_mode
         
         # Use provided base_fragmenter or create default RandomFragmenter
         self.base_fragmenter = base_fragmenter or RandomFragmenter(
@@ -785,6 +790,16 @@ class VARIQueryFragmenter(Fragmenter):
         
         # Initialize VAE
         self.vae = self._create_vae()
+
+        if self.duo_mode:
+            self.reward_diff_selector = RewardDifferenceSelector(
+                preference_model=preference_model,
+                logger=custom_logger,
+                min_k=2,
+                max_k=10,
+                random_state=42,
+                use_elbow=False,
+            )
 
     def _create_vae(self) -> MLPStateVAE:
         """Create a new VAE instance with the stored parameters."""
@@ -843,9 +858,22 @@ class VARIQueryFragmenter(Fragmenter):
         # Step 3: Cluster and sample final pairs
         clusters = self._cluster_latent_space(D_z, num_clusters=self.variquery_num_clusters)
 
-        # Step 4: Sample and rank pairs
-        pairs = self._sample_random_pairs(clusters, D_un, num_pairs)
-        ranked_pairs = self._rank_by_ensemble_variance(pairs)
+        # Step 4: Sample pairs
+        pairs = self._sample_random_pairs(clusters, D_un, num_pairs=int(num_pairs * self.fragment_sample_factor))
+        uncertainty_on = "probs_interval" if self.duo_mode else "logit"
+
+        # Rank pairs by uncertainty
+        ranked_pairs = self._rank_by_ensemble_variance(pairs, uncertainty_on=uncertainty_on)
+
+        if self.duo_mode:
+            top_m_pairs = ranked_pairs[:((num_pairs * self.fragment_sample_factor) // 2)]
+            pairs = self.reward_diff_selector.select_pairs(
+                candidate_pairs=top_m_pairs,
+                num_pairs=num_pairs,
+                current_iteration=self.current_iteration,
+            )
+        else:
+            pairs = ranked_pairs[:num_pairs]
 
         # Always create visualization directory
         output_dir = self.logger.get_dir()
@@ -859,7 +887,7 @@ class VARIQueryFragmenter(Fragmenter):
         self.visualizer.visualize_clusters_and_pairs(
             D_z,
             clusters,
-            ranked_pairs[:num_pairs],
+            pairs,
             self.fragments_to_indices,
             save_path=viz_path,
             title=f'Clusters and Selected Pairs (Iteration {self.current_iteration})'
@@ -869,7 +897,7 @@ class VARIQueryFragmenter(Fragmenter):
         self.current_iteration += 1
         
         # Step 5: Return top N pairs
-        return ranked_pairs[:num_pairs]
+        return pairs
         
 
     @th.no_grad()
@@ -964,12 +992,13 @@ class VARIQueryFragmenter(Fragmenter):
     def _rank_by_ensemble_variance(
         self,
         pairs: List[TrajectoryWithRewPair],
+        uncertainty_on: str = "logit",
     ) -> List[TrajectoryWithRewPair]:
         print("pairs type:", type(pairs))  # Actual type of the pair
         print("is list:", isinstance(pairs, list))  # Check if it's actually a tuple
 
         """Rank pairs based on the disagreement of the ensemble members"""
-        variances = []
+        uncertainties = []
         for pair in pairs:
             first = pair[0]
             second = pair[1]
@@ -980,16 +1009,56 @@ class VARIQueryFragmenter(Fragmenter):
                 rews1 = self.preference_model.rewards(trans1)
                 rews2 = self.preference_model.rewards(trans2)
 
-            returns1 = rews1.sum(dim=0)
-            returns2 = rews2.sum(dim=0)
-
-
-            var = th.var(returns1 - returns2, dim=0)
-            variances.append(var)
+            # Ensure rewards are in the correct sha
+            uncertainties.append(self.uncertainty_estimate(
+                rews1=rews1,
+                rews2=rews2,
+                uncertainty_on=uncertainty_on,
+            ))
         
         # Sort the pairs by the variance of the rewards
-        sorted_pairs = [x for _, x in sorted(zip(variances, pairs), key=lambda pair: pair[0], reverse=True)]
+        sorted_pairs = [x for _, x in sorted(zip(uncertainties, pairs), key=lambda pair: pair[0], reverse=True)]
         return sorted_pairs
+
+    def uncertainty_estimate(self, rews1: th.Tensor, rews2: th.Tensor, uncertainty_on: str = "logit") -> float:
+        """Gets the uncertainty estimate from the rewards of a fragment pair.
+
+        Args:
+            rews1: rewards obtained by all the ensemble models for the first fragment.
+                Shape - (fragment_length, num_ensemble_members)
+            rews2: rewards obtained by all the ensemble models for the second fragment.
+                Shape - (fragment_length, num_ensemble_members)
+            uncertainty_on: the type of uncertainty estimate to use. Options are: logit, probability, label, probs_interval.
+
+        Returns:
+            the uncertainty estimate based on the `uncertainty_on` flag.
+        """
+        if uncertainty_on == "logit":
+            returns1, returns2 = rews1.sum(0), rews2.sum(0)
+            return (returns1 - returns2).var().item()
+        elif uncertainty_on == "probability":
+            probs = self.preference_model.probability(rews1, rews2)
+            probs_np = probs.cpu().numpy()
+            assert probs_np.shape == (self.preference_model.model.num_members,)
+            return probs_np.var()
+        elif uncertainty_on == "label":
+            probs = self.preference_model.probability(rews1, rews2)
+            probs_np = probs.cpu().numpy()
+            assert probs_np.shape == (self.preference_model.model.num_members,)
+            preds = (probs_np > 0.5).astype(np.float32)
+            # probability estimate of Bernoulli random variable
+            prob_estimate = preds.mean()
+            # variance estimate of Bernoulli random variable
+            return prob_estimate * (1 - prob_estimate)
+        elif uncertainty_on == "probs_interval":
+            probs = self.preference_model.probability(rews1, rews2)
+            probs_np = probs.cpu().numpy()
+            if not hasattr(self.preference_model, 'ensemble_model') or self.preference_model.ensemble_model is None:
+                raise ValueError("'probs_interval' uncertainty_on requires an ensemble model.")
+            return np.max(probs_np) - np.min(probs_np)
+        else:
+            raise ValueError(f"Unknown uncertainty_on type: {uncertainty_on}. "
+                             "Options are: logit, probability, label, probs_interval.")
 
     def _train_vae(
         self,

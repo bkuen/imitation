@@ -30,12 +30,146 @@ class ElbowVisualizer:
         plt.grid(True, linestyle='--', alpha=0.7)
         plt.xticks(K_range)
         if save_path:
+            os.makedirs(os.path.dirname(save_path), exist_ok=True)
             plt.savefig(save_path, bbox_inches='tight', dpi=150)
         if show:
             plt.show()
         plt.close()
         if self.logger:
             self.logger.log(f"Elbow plot saved to {save_path}")
+
+class RewardDifferenceSelector:
+    def __init__(
+        self,
+        preference_model: PreferenceModel,
+        logger: Optional[imit_logger.HierarchicalLogger] = None,
+        min_k: int = 2,
+        max_k: int = 10,
+        random_state: int = 42,
+        use_elbow: bool = False,
+    ):
+        """
+        Args:
+            preference_model: The reward model used to compute predicted rewards.
+        """
+        self.preference_model = preference_model
+        self.logger = logger or imit_logger.configure()
+        self.elbow_visualizer = ElbowVisualizer(logger=logger)
+        self.min_k = min_k
+        self.max_k = max_k
+        self.random_state = random_state
+        self.use_elbow = use_elbow
+
+    def select_pairs(
+        self,
+        candidate_pairs: Sequence[TrajectoryWithRewPair],
+        num_pairs: int,
+        current_iteration: int,
+    ):
+        """
+        Selects pairs based on the reward difference.
+
+        Args:
+            candidate_pairs: List of candidate trajectory pairs.
+            num_pairs: Number of pairs to select.
+
+        Returns:
+            List of selected trajectory pairs.
+        """
+        if len(candidate_pairs) == 0:
+            return []
+
+        # Compute reward difference vectors for each pair
+        reward_diffs = self._calculate_distances(candidate_pairs)
+        reward_diffs = reward_diffs.cpu().numpy()
+
+        # Find optimal k using elbow method
+        optimal_k = self._find_optimal_k(reward_diffs, num_pairs=num_pairs, current_iteration=current_iteration) if self.use_elbow else num_pairs
+
+        # Perform KMeans clustering on the reward differences
+        clustering = KMeans(n_clusters=optimal_k, random_state=self.random_state, n_init=10, max_iter=300)
+        clustering.fit(reward_diffs)
+        labels = clustering.labels_  # array [N]
+        centers = clustering.cluster_centers_  # array [k, D]
+
+        # For each cluster, pick the member whose feature vector is closest to its center
+        selected_indices = []
+        for cluster_id in range(optimal_k):
+            member_mask = (labels == cluster_id)
+            if not np.any(member_mask):
+                continue
+
+            members = reward_diffs[member_mask]  # [M, D]
+            center = centers[cluster_id]  # [D]
+            # compute Euclidean distances from center
+            dists = np.linalg.norm(members - center, axis=1)  # [M]
+            # find the original index of the closest member
+            member_indices = np.nonzero(member_mask)[0]  # [M]
+            closest_member = member_indices[np.argmin(dists)]
+            selected_indices.append(int(closest_member))
+
+        # Map back to trajectory pairs
+        selected_pairs = [candidate_pairs[i] for i in selected_indices]
+        return selected_pairs
+
+
+    def _calculate_distances(self, pairs: Sequence[TrajectoryWithRewPair]):
+        diff_vecs = []
+        for frag1, frag2 in pairs:
+            trans1 = rollout.flatten_trajectories([frag1])
+            trans2 = rollout.flatten_trajectories([frag2])
+            with th.no_grad():
+                r1 = self.preference_model.rewards(trans1)
+                r2 = self.preference_model.rewards(trans2)
+                # Pad to same length if needed
+                minlen = min(len(r1), len(r2))
+                r1, r2 = r1[:minlen], r2[:minlen]
+                diff = r2 - r1
+                # Flatten the difference vector for each pair
+                diff_vecs.append(diff.flatten())
+
+        # Stack all differences into a single tensor
+        diff_vecs = th.stack(diff_vecs)  # Shape: (num_pairs, flattened_diff_length)
+        diff_vecs = (diff_vecs - diff_vecs.mean(dim=0)) / (diff_vecs.std(dim=0) + 1e-8)
+        return diff_vecs
+
+    def _find_optimal_k(self, reward_diffs: np.array, num_pairs: int, current_iteration: int):
+        B = reward_diffs.shape[0]
+
+        inertias = []
+        min_k = max(self.min_k, 2)
+        max_k = min(self.max_k, B)
+        K_range = range(min_k, max_k + 1)
+        for k in K_range:
+            kmeans = KMeans(n_clusters=k, random_state=self.random_state, n_init=10, max_iter=300)
+            kmeans.fit(reward_diffs)
+            inertias.append(kmeans.inertia_)
+
+        output_dir = self.logger.get_dir()
+        os.makedirs(output_dir, exist_ok=True)
+        plot_path = os.path.join(
+            output_dir,
+            f"reward_differences/elbow/elbow_iteration_{current_iteration:04d}.png"
+        )
+
+        self.elbow_visualizer.plot_elbow(
+            list(K_range), inertias, save_path=plot_path, show=False,
+            title="Elbow Method for KMeans (Reward Difference Space)"
+        )
+
+        try:
+            from kneed import KneeLocator
+            kl = KneeLocator(K_range, inertias, curve='convex', direction='decreasing')
+            optimal_k = kl.knee
+        except Exception as e:
+            self.logger.warn(f"KneeLocator failed: {e}")
+            optimal_k = None
+
+        if optimal_k is None:
+            optimal_k = num_pairs
+
+        self.logger.info(f"Optimal k suggested by KneeLocator: {optimal_k}")
+        return optimal_k
 
 class RewardDifferenceDiversityFragmenter(Fragmenter):
     """Selects diverse queries by clustering in the space of predicted reward differences (DUO/ξD)."""
@@ -45,11 +179,9 @@ class RewardDifferenceDiversityFragmenter(Fragmenter):
         base_fragmenter: Fragmenter,
         max_k: int = 10,
         min_k: int = 2,
-        elbow_tol: float = 0.05,
         random_state: int = 42,
         fragment_sample_factor: float = 10.0,
         custom_logger: Optional[imit_logger.HierarchicalLogger] = None,
-        visualize_elbow: bool = True,
         clustering_method: str = "kmeans",
     ):
         """
@@ -69,7 +201,6 @@ class RewardDifferenceDiversityFragmenter(Fragmenter):
         self.base_fragmenter = base_fragmenter
         self.max_k = max_k
         self.min_k = min_k
-        self.elbow_tol = elbow_tol
         self.fragment_sample_factor = fragment_sample_factor
         self.random_state = random_state
         self.visualize_elbow = visualize_elbow

@@ -44,7 +44,7 @@ class PriorityReplayBuffer:
             # Clip log probabilities to avoid numerical instability
             # -100 is a reasonable lower bound as exp(-100) ≈ 3.7e-44
             # This prevents -inf values while still allowing very low probabilities
-            log_probs = th.clamp(log_probs, min=-100.0)
+            # log_probs = th.clamp(log_probs, min=-100.0)
         return log_probs.sum().item()
 
     def add(self, trajectories: Sequence[TrajectoryWithRew]) -> None:
