@@ -851,20 +851,19 @@ class VARIQueryFragmenter(Fragmenter):
         output_dir = self.logger.get_dir()
         os.makedirs(output_dir, exist_ok=True)
 
-        if self.current_iteration % 10 == 0:
-            # Visualize clusters
-            viz_path = os.path.join(
-                output_dir,
-                f"clusters_iteration_{self.current_iteration:04d}.png"
-            )
-            self.visualizer.visualize_clusters_and_pairs(
-                D_z,
-                clusters,
-                ranked_pairs[:num_pairs],
-                self.fragments_to_indices,
-                save_path=viz_path,
-                title=f'Clusters and Selected Pairs (Iteration {self.current_iteration})'
-            )
+        # Visualize clusters
+        viz_path = os.path.join(
+            output_dir,
+            f"clusters/clusters_iteration_{self.current_iteration:04d}.png"
+        )
+        self.visualizer.visualize_clusters_and_pairs(
+            D_z,
+            clusters,
+            ranked_pairs[:num_pairs],
+            self.fragments_to_indices,
+            save_path=viz_path,
+            title=f'Clusters and Selected Pairs (Iteration {self.current_iteration})'
+        )
 
         # Increment the number of iterations
         self.current_iteration += 1
