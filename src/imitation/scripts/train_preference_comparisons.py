@@ -8,10 +8,8 @@ import functools
 import pathlib
 from typing import Any, Mapping, Optional, Type, Union
 
-import os
 import numpy as np
 import torch as th
-from imitation.util.util import make_seeds
 from sacred.observers import FileStorageObserver
 from stable_baselines3.common import type_aliases
 
@@ -26,7 +24,7 @@ from imitation.scripts.ingredients import logging as logging_ingredient
 from imitation.scripts.ingredients import policy_evaluation, reward
 from imitation.scripts.ingredients import rl as rl_common
 import imitation.algorithms.variquery.variquery as variquery
-from imitation.algorithms.duo.duo import RewardDifferenceDiversityFragmenter
+from imitation.algorithms.duo.duo import RewardDifferenceDiversityFragmenter, ConsensualFiltering
 
 
 def save_model(
@@ -83,9 +81,13 @@ def train_preference_comparisons(
     gatherer_kwargs: Mapping[str, Any],
     active_selection: bool,
     active_selection_oversampling: int,
+    duo_enabled: bool,
+    duo_oversampling: int,
+    duo_use_consensual_filtering: bool,
     variquery_enabled: bool,
     variquery_oversampling: int,
     variquery_num_clusters: int,
+    variquery_duo_mode: bool,
     vae_epochs: int,
     vae_latent_dim: int,
     vae_hidden_dims: list[int],
@@ -106,8 +108,6 @@ def train_preference_comparisons(
     query_schedule: Union[str, type_aliases.Schedule],
     _rnd: np.random.Generator,
     sampling_strategy: str = 'random',
-    diversity_filtering: Optional[str] = None,
-    diversity_filtering_clustering_method: str = "kmeans",
     replay_buffer_size: int = 1000000,
 ) -> Mapping[str, Any]:
     """Train a reward model using preference comparisons.
@@ -282,6 +282,7 @@ def train_preference_comparisons(
                 base_fragmenter=fragmenter,
                 rng=_rnd,
                 variquery_num_clusters=variquery_num_clusters,
+                duo_mode=variquery_duo_mode,
                 vae_epochs=vae_epochs,
                 vae_latent_dim=vae_latent_dim,
                 vae_hidden_dims=vae_hidden_dims,
@@ -298,16 +299,15 @@ def train_preference_comparisons(
                 device=agent_trainer.algorithm.device,
             )
 
-        if diversity_filtering is not None:
-            if diversity_filtering == "reward_difference":
-                fragmenter = RewardDifferenceDiversityFragmenter(
-                    preference_model=preference_model,
-                    base_fragmenter=fragmenter,
-                    custom_logger=custom_logger,
-                    clustering_method=diversity_filtering_clustering_method,
-                )
-            else:
-                raise ValueError(f"Invalid diversity filtering: {diversity_filtering}")
+        if duo_enabled:
+            fragmenter = RewardDifferenceDiversityFragmenter(
+                preference_model=preference_model,
+                base_fragmenter=fragmenter,
+                custom_logger=custom_logger,
+                total_timesteps=total_timesteps,
+                fragment_sample_factor=duo_oversampling,
+                use_consensual_filtering=duo_use_consensual_filtering,
+            )
 
         gatherer = gatherer_cls(
             **gatherer_kwargs,

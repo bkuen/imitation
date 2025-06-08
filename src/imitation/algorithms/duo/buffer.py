@@ -73,9 +73,19 @@ class PriorityReplayBuffer:
         else:
             probs = z_scores / z_scores.sum()
 
+        self.logger.info(f"ALARM!!!! Sampled {size} trajectories out of {len(self.trajectories)} trajectories")
+
+        z_scores_0_count = np.sum(z_scores == 0).item()
+        replace = False
+        if (len(self.trajectories) - z_scores_0_count) < size:
+            self.logger.info(
+                f"Not enough trajectories with non-zero on-policiness to sample {size} trajectories. Sampling with replacement."
+            )
+            replace = True
+
         # Sample trajectories with these probabilities
         sampled_indices = self.rng.choice(
-            len(self.trajectories), size=size, p=probs
+            len(self.trajectories), size=size, p=probs, replace=replace
         )
         return [self.trajectories[i] for i in sampled_indices]
 

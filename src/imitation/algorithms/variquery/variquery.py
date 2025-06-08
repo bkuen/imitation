@@ -3,7 +3,6 @@ from sklearn.cluster import KMeans
 import matplotlib.pyplot as plt
 import os
 
-from helpers.playground.kruskal import uncertainty
 from imitation.algorithms.duo.duo import RewardDifferenceSelector
 from imitation.algorithms.preference_comparisons import Fragmenter, PreferenceModel, RandomFragmenter
 from imitation.data import rollout
@@ -818,6 +817,7 @@ class VARIQueryFragmenter(Fragmenter):
         trajectories: Sequence[TrajectoryWithRew],
         fragment_length: int,
         num_pairs: int,
+        metrics: Dict[str, float],
     ) -> Sequence[TrajectoryWithRewPair]:
         # Check if we need to retrain the VAE from scratch
         if (self.vae_retrain_interval is not None and 
@@ -833,7 +833,8 @@ class VARIQueryFragmenter(Fragmenter):
         initial_fragments = self.base_fragmenter(
             trajectories=trajectories,
             fragment_length=fragment_length,
-            num_pairs=fragments_to_sample
+            num_pairs=fragments_to_sample,
+            metrics=metrics,
         )
         
         # Convert to dataset for VAE training
@@ -994,9 +995,6 @@ class VARIQueryFragmenter(Fragmenter):
         pairs: List[TrajectoryWithRewPair],
         uncertainty_on: str = "logit",
     ) -> List[TrajectoryWithRewPair]:
-        print("pairs type:", type(pairs))  # Actual type of the pair
-        print("is list:", isinstance(pairs, list))  # Check if it's actually a tuple
-
         """Rank pairs based on the disagreement of the ensemble members"""
         uncertainties = []
         for pair in pairs:

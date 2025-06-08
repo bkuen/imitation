@@ -56,9 +56,13 @@ def train_defaults():
     gatherer_kwargs = {}
     active_selection = False
     active_selection_oversampling = 2
+    duo_enabled = True
+    duo_oversampling = 10
+    duo_use_consensual_filtering = False
     variquery_enabled = False
     variquery_oversampling = 2
     variquery_num_clusters = 3
+    variquery_duo_mode = False
     vae_latent_dim = 16
     vae_hidden_dims = [128, 64, 32]
     vae_lr = 1e-3
@@ -84,8 +88,6 @@ def train_defaults():
     checkpoint_interval = 0  # Num epochs between saving (<0 disables, =0 final only)
     query_schedule = "hyperbolic"
     sampling_strategy = 'random'
-    diversity_filtering = None
-    diversity_filtering_clustering_method = "kmeans"
     replay_buffer_size = 1000000
 
 

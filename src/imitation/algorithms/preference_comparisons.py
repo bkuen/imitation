@@ -531,7 +531,6 @@ class PreferenceModel(nn.Module):
             assert probability.shape == ()
         return probability
 
-
 class Fragmenter(abc.ABC):
     """Class for creating pairs of trajectory fragments from a set of trajectories."""
 
@@ -549,6 +548,7 @@ class Fragmenter(abc.ABC):
         trajectories: Sequence[TrajectoryWithRew],
         fragment_length: int,
         num_pairs: int,
+        metrics: Dict[str, Any],
     ) -> Sequence[TrajectoryWithRewPair]:
         """Create fragment pairs out of a sequence of trajectories.
 
@@ -599,6 +599,7 @@ class RandomFragmenter(Fragmenter):
         trajectories: Sequence[TrajectoryWithRew],
         fragment_length: int,
         num_pairs: int,
+        metrics: Dict[str, Any],
     ) -> Sequence[TrajectoryWithRewPair]:
         fragments: List[TrajectoryWithRew] = []
 
@@ -732,6 +733,7 @@ class UncertaintyFragmenter(Fragmenter):
         trajectories: Sequence[TrajectoryWithRew],
         fragment_length: int,
         num_pairs: int,
+        metrics: Dict[str, Any],
     ) -> Sequence[TrajectoryWithRewPair]:
         # sample a large number (self.fragment_sample_factor*num_pairs)
         # of fragments from all the trajectories
@@ -740,6 +742,7 @@ class UncertaintyFragmenter(Fragmenter):
             trajectories=trajectories,
             fragment_length=fragment_length,
             num_pairs=fragments_to_sample,
+            metrics=metrics,
         )
 
         uncertainties = np.zeros(len(fragment_pairs))
@@ -1814,7 +1817,13 @@ class PreferenceComparisons(base.BaseImitationAlgorithm):
             #If priority sampling is used, we sample trajectories from the buffer
             if self.sampling_strategy == 'priority':
                 self.replay_buffer.add(trajectories)
-                trajectories = self.replay_buffer.sample(num_steps)
+                while len(self.replay_buffer) < num_pairs:
+                    # If the replay buffer is not large enough, sample more trajectories
+                    self.logger.log("Replay buffer too small, sampling more trajectories")
+                    additional_trajectories = self.trajectory_generator.sample(num_steps)
+                    self.replay_buffer.add(additional_trajectories)
+
+                trajectories = self.replay_buffer.sample(num_pairs)
     
 
             # This assumes there are no fragments missing initial timesteps
@@ -1822,7 +1831,11 @@ class PreferenceComparisons(base.BaseImitationAlgorithm):
             horizons = (len(traj) for traj in trajectories if traj.terminal)
             self._check_fixed_horizon(horizons)
             self.logger.log("Creating fragment pairs")
-            fragments = self.fragmenter(trajectories, self.fragment_length, num_pairs)
+            fragmenter_metrics: Dict[str, Any] = {
+                "reward_accuracy": reward_accuracy if reward_accuracy is not None else 0.0,
+                "current_timestep": self._iteration * timesteps_per_iteration,
+            }
+            fragments = self.fragmenter(trajectories, self.fragment_length, num_pairs, fragmenter_metrics)
             with self.logger.accumulate_means("preferences"):
                 self.logger.log("Gathering preferences")
                 preferences = self.preference_gatherer(fragments)
